@@ -22,40 +22,27 @@ def parse_address(raw: str):
     return number, name
 
 def parse_results_html(html: str) -> list:
-    """
-    Parse the document results table from raw HTML.
-    Each row has:
-    - OpenWindow('RECORD_ID', 'Hidden'/'Visible', 'GUID') on all links
-    - Hidden input with comments: grdIdisResult_hidComments_N
-    - Digital image link: OpenDocument('{GUID},') — only visible if image exists
-    """
     soup = BeautifulSoup(html, "html.parser")
     records = []
 
-    # Find the results grid table
     grid = soup.find("table", id="grdIdisResult")
     if not grid:
-        logger.warning("grdIdisResult table not found")
-        # Try fallback: any table with OpenWindow links
-        all_links = soup.find_all("a", href=re.compile(r"OpenWindow", re.I))
-        logger.info(f"Found {len(all_links)} OpenWindow links")
+        logger.warning("grdIdisResult table not found in HTML")
         return records
 
     rows = grid.find_all("tr")
     logger.info(f"Grid rows: {len(rows)}")
 
-    for i, row in enumerate(rows[1:]):  # skip header
+    for i, row in enumerate(rows[1:]):
         cells = row.find_all("td")
         if len(cells) < 5:
             continue
 
-        # Extract record ID and image GUID from OpenWindow call in first link
         doc_link = cells[1].find("a")
         if not doc_link:
             continue
 
         href = doc_link.get("href", "")
-        # Match: OpenWindow('RECORD_ID', 'Hidden'/'Visible', 'GUID')
         m = re.search(r"OpenWindow\('(\d+)','(Hidden|Visible)','([^']*)'\)", href, re.I)
         if not m:
             continue
@@ -69,16 +56,13 @@ def parse_results_html(html: str) -> list:
         doc_date = cells[3].get_text(strip=True) if len(cells) > 3 else ""
         doc_number = cells[4].get_text(strip=True) if len(cells) > 4 else ""
 
-        # Extract comments from hidden input
         comment_input = row.find("input", id=re.compile(r"hidComments"))
         comments = comment_input.get("value", "") if comment_input else ""
 
-        # Digital image URL — only if Visible
         digital_image_url = None
         if image_visible and image_guid:
             digital_image_url = f"{BASE_URL}/ImageMain.aspx?DocIds={image_guid}"
 
-        # Detail page URL
         detail_url = f"{BASE_URL}/Report.aspx?Record_Id={record_id}&Image=Hidden&ImageToOpen="
 
         record = {
@@ -118,7 +102,7 @@ class LADBSScraper:
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
             )
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = await context.new_page()
             page.set_default_timeout(30000)
@@ -135,154 +119,62 @@ class LADBSScraper:
             logger.warning(f"goto warning: {e}")
         await asyncio.sleep(2)
 
-    async def _get_viewstate(self, page):
-        vs, vsg, ev = "", "", ""
-        try:
-            vs = await page.eval_on_selector("input[name='__VIEWSTATE']", "el => el.value") or ""
-        except: pass
-        try:
-            vsg = await page.eval_on_selector("input[name='__VIEWSTATEGENERATOR']", "el => el.value") or ""
-        except: pass
-        try:
-            ev = await page.eval_on_selector("input[name='__EVENTVALIDATION']", "el => el.value") or ""
-        except: pass
-        return vs, vsg, ev
-
-    async def _get_hidden_fields(self, page):
-        fields = {}
-        hiddens = await page.query_selector_all("input[type='hidden']")
-        for h in hiddens:
-            n = await h.get_attribute("name")
-            v = await h.get_attribute("value") or ""
-            if n:
-                fields[n] = v
-        return fields
-
     async def _run(self, page, context, number, street_name, raw_address):
-        # Step 1: Establish session
+        # Step 1: Load main page for session, then search form
         await self._goto(page, MAIN_URL)
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
 
-        vs, vsg, ev = await self._get_viewstate(page)
-        hidden = await self._get_hidden_fields(page)
-        cookies = {c["name"]: c["value"] for c in await context.cookies()}
+        # Step 2: Fill and submit search form via Playwright
+        await page.fill("input[name='Address$txtAddressBegNo']", number)
+        await page.fill("input[name='Address$txtAddressStreetName']", street_name)
+        await page.click("input[name='btnNext1']")
+        await asyncio.sleep(3)
+        logger.info(f"After search submit: {page.url}")
 
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Origin": "https://ladbsdoc.lacity.org",
-        }
-
-        # Step 2: POST search form
-        post_data = {**hidden,
-            "__VIEWSTATE": vs,
-            "__VIEWSTATEGENERATOR": vsg,
-            "__EVENTVALIDATION": ev,
-            "__EVENTTARGET": "",
-            "__EVENTARGUMENT": "",
-            "Address$txtAddressBegNo": number,
-            "Address$txtAddressStreetName": street_name,
-            "btnNext1": "Next",
-        }
-
-        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR"
-        logger.info(f"POST search: {number} {street_name}")
-
-        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
-            resp = await client.post(form_url, data=post_data, headers=headers)
-            html1 = resp.text
-            for k, v in resp.cookies.items():
-                cookies[k] = v
-
-        await page.set_content(html1)
-        await asyncio.sleep(1)
-
-        # Step 3: Handle address selection checkboxes
-        checkboxes = await page.query_selector_all("input[type='checkbox']")
-        logger.info(f"Checkboxes: {len(checkboxes)}")
+        # Step 3: Address selection — check all and continue
+        checkboxes = await page.query_selector_all("input[type='checkbox']:not([id*='CheckAll'])")
+        logger.info(f"Address checkboxes: {len(checkboxes)}")
 
         if len(checkboxes) > 0:
-            vs2, vsg2, ev2 = await self._get_viewstate(page)
-            hidden2 = await self._get_hidden_fields(page)
-
-            cb_data = {}
             for cb in checkboxes:
-                cb_name = await cb.get_attribute("name") or ""
-                cb_val = await cb.get_attribute("value") or ""
-                if cb_name and "all" not in cb_name.lower():
-                    cb_data[cb_name] = cb_val
+                try:
+                    await cb.check()
+                except: pass
 
-            continue_btn = await page.query_selector("input[value='Continue']")
-            continue_name = await continue_btn.get_attribute("name") if continue_btn else "btnSearch"
+            # Click continue/search button
+            continue_btn = await page.query_selector("input[name='btnSearch'], input[value='Continue']")
+            if continue_btn:
+                await continue_btn.click()
+                await asyncio.sleep(4)
+            logger.info(f"After continue: {page.url}")
 
-            post_data2 = {**hidden2,
-                "__VIEWSTATE": vs2,
-                "__VIEWSTATEGENERATOR": vsg2,
-                "__EVENTVALIDATION": ev2,
-                "__EVENTTARGET": "",
-                "__EVENTARGUMENT": "",
-                continue_name: "Continue",
-                **cb_data,
-            }
+        # Step 4: Parse results — we're now on the DocumentSearch results page
+        # Use the browser's actual rendered HTML
+        html = await page.content()
+        logger.info(f"Results HTML length: {len(html)}")
 
-            async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
-                resp2 = await client.post(form_url, data=post_data2, headers=headers)
-                results_html = resp2.text
-                results_url = str(resp2.url)
-                for k, v in resp2.cookies.items():
-                    cookies[k] = v
-        else:
-            results_html = html1
-            results_url = form_url
-
-        logger.info(f"Results page: {results_url}, length: {len(results_html)}")
-
-        # Step 4: Parse page 1
-        all_records = parse_results_html(results_html)
+        all_records = parse_results_html(html)
         logger.info(f"Page 1: {len(all_records)} records")
 
-        # Step 5: Handle pagination using goPage POST
-        # Check for page 2+ links
-        soup = BeautifulSoup(results_html, "html.parser")
+        # Step 5: Handle pagination — click page 2, 3 etc
+        soup = BeautifulSoup(html, "html.parser")
         page_nav = soup.find("div", id="pnlNavigate")
         if page_nav:
             page_links = page_nav.find_all("a")
             for pg_link in page_links:
                 pg_text = pg_link.get_text(strip=True)
                 if pg_text.isdigit() and int(pg_text) > 1:
-                    pg_num = int(pg_text)
-                    logger.info(f"Fetching page {pg_num}...")
-
-                    # Load results page in Playwright to get its form state
-                    await page.set_content(results_html)
-                    await asyncio.sleep(1)
-
-                    vs3, vsg3, ev3 = await self._get_viewstate(page)
-                    hidden3 = await self._get_hidden_fields(page)
-
-                    # Update headers referer
-                    headers["Referer"] = results_url
-
-                    post_pg = {**hidden3,
-                        "__VIEWSTATE": vs3,
-                        "__VIEWSTATEGENERATOR": vsg3,
-                        "__EVENTVALIDATION": ev3,
-                        "__EVENTTARGET": "",
-                        "__EVENTARGUMENT": "",
-                        "PageNavigate": "true",
-                        "PageNo": str(pg_num),
-                    }
-
-                    async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
-                        resp_pg = await client.post(results_url, data=post_pg, headers=headers)
-                        pg_html = resp_pg.text
-                        for k, v in resp_pg.cookies.items():
-                            cookies[k] = v
-
-                    pg_records = parse_results_html(pg_html)
-                    logger.info(f"Page {pg_num}: {len(pg_records)} records")
-                    all_records.extend(pg_records)
+                    logger.info(f"Navigating to page {pg_text}...")
+                    try:
+                        # Use JavaScript to call goPage
+                        await page.evaluate(f"goPage('{pg_text}')")
+                        await asyncio.sleep(4)
+                        pg_html = await page.content()
+                        pg_records = parse_results_html(pg_html)
+                        logger.info(f"Page {pg_text}: {len(pg_records)} records")
+                        all_records.extend(pg_records)
+                    except Exception as e:
+                        logger.warning(f"Page {pg_text} failed: {e}")
 
         logger.info(f"Total records: {len(all_records)}")
 
@@ -295,15 +187,23 @@ class LADBSScraper:
                 "summary": "No records found.",
             }
 
-        # Step 6: Scrape detail pages for additional info
+        # Step 6: Scrape detail pages using the same browser session
         detailed = []
         all_attachments = []
 
         for i, rec in enumerate(all_records):
             logger.info(f"Detail {i+1}/{len(all_records)}: {rec['doc_type']} {rec['doc_number']}")
             try:
-                detail = await self._scrape_detail(rec)
-                rec.update(detail)
+                await self._goto(page, rec["detail_url"])
+                detail_html = await page.content()
+
+                # Check for session expired
+                if "SessionExpired" in page.url or "IdisError" in page.url:
+                    logger.warning(f"Session expired on detail {i+1}, skipping")
+                    rec["detail_error"] = "Session expired"
+                else:
+                    detail = self._parse_detail_html(detail_html)
+                    rec.update(detail)
             except Exception as e:
                 logger.warning(f"Detail {i+1} failed: {e}")
                 rec["detail_error"] = str(e)
@@ -319,29 +219,18 @@ class LADBSScraper:
             "summary": self._build_summary(detailed, raw_address),
         }
 
-    async def _scrape_detail(self, rec: dict) -> dict:
-        """Fetch the detail page and extract structured fields."""
-        detail_url = rec.get("detail_url")
-        if not detail_url:
-            return {}
-
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
-            resp = await client.get(detail_url)
-            html = resp.text
-
+    def _parse_detail_html(self, html: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
         detail = {}
 
-        # The detail page uses <b>Field: </b>value pattern inside <Font> tags
-        # Extract all bold labels and their following text
+        # Extract bold label: value pairs
         for b_tag in soup.find_all("b"):
-            label_text = b_tag.get_text(strip=True).rstrip(":")
-            # Get the text immediately after the <b> tag
-            next_text = b_tag.next_sibling
-            if next_text and isinstance(next_text, str):
-                value = next_text.strip()
-                if value and value != "None":
-                    key = label_text.lower().replace(" ", "_")
+            label = b_tag.get_text(strip=True).rstrip(":")
+            next_sib = b_tag.next_sibling
+            if next_sib and isinstance(next_sib, str):
+                value = next_sib.strip()
+                if value and value.lower() != "none":
+                    key = label.lower().replace(" ", "_")
                     detail[key] = value
 
         return detail
