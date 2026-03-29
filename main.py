@@ -1,10 +1,10 @@
 import os
+import uvicorn
+import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from scraper import LADBSScraper
-import logging
-import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ async def scrape(request: ScrapeRequest):
     logger.info(f"Scrape request for: {request.address}")
     try:
         scraper = LADBSScraper()
-        result = scraper.scrape(request.address)
+        result = await scraper.scrape(request.address)
         return result
     except Exception as e:
         logger.error(f"Scrape failed: {e}")
