@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import base64
+import httpx
 from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
@@ -36,213 +37,233 @@ class LADBSScraper:
             page = await context.new_page()
             page.set_default_timeout(30000)
             try:
-                result = await self._run_search(page, number, street_name, address)
-                return result
+                return await self._run(page, context, number, street_name, address)
             finally:
                 await browser.close()
 
     async def _goto(self, page, url):
-        logger.info(f"Navigating to: {url}")
+        logger.info(f"→ {url}")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception as e:
             logger.warning(f"goto warning: {e}")
         await asyncio.sleep(2)
 
-    async def _run_search(self, page, number, street_name, raw_address):
-        # Step 1: Main page for session
+    async def _run(self, page, context, number, street_name, raw_address):
+        # 1. Establish session
         await self._goto(page, MAIN_URL)
 
-        # Step 2: Go to address search form
+        # 2. Load search form
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
-        logger.info(f"Form URL: {page.url}")
 
-        # Step 3: Find and fill text inputs
+        # 3. Fill form
         text_inputs = await page.query_selector_all(
-            "input[type='text'], input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='image']):not([type='checkbox'])"
+            "input[type='text'], input:not([type='hidden']):not([type='submit'])"
+            ":not([type='button']):not([type='image']):not([type='checkbox'])"
         )
-        logger.info(f"Found {len(text_inputs)} text inputs")
-
         if len(text_inputs) == 0:
-            return {"address": raw_address, "error": "No text inputs on form", "url": page.url}
+            return {"address": raw_address, "error": "No inputs on search form", "url": page.url}
 
         await text_inputs[0].fill(number)
         if len(text_inputs) >= 2:
             await text_inputs[1].fill(street_name)
 
-        # Step 4: Submit the search form
-        submit = await page.query_selector("input[type='submit'], input[type='button'][value*='Next'], input[type='button'][value*='Search'], a[href*='Next']")
-        if not submit:
-            # Try any button-like element
-            buttons = await page.query_selector_all("input[type='button'], button")
-            for btn in buttons:
-                val = (await btn.get_attribute("value") or await btn.inner_text() or "").lower()
-                if any(k in val for k in ["next", "search", "find", "continue", "go"]):
-                    submit = btn
-                    break
-
+        # 4. Submit search
+        submit = await page.query_selector("input[type='submit'], input[type='button']")
         if submit:
             await submit.click()
         else:
             await page.keyboard.press("Enter")
-
         await asyncio.sleep(3)
-        logger.info(f"After form submit URL: {page.url}")
 
-        # Step 5: Handle the address selection page
-        # The page shows a table of matching addresses with checkboxes
-        # We need to check ALL checkboxes (or the first one) and click Continue
-        return await self._handle_address_selection(page, raw_address)
-
-    async def _handle_address_selection(self, page, raw_address):
-        content = await page.content()
-        url = page.url
-        logger.info(f"Address selection page URL: {url}")
-
-        # Check if this is the address selection intermediate page
-        # It has checkboxes for address matches
+        # 5. Address selection page — check All and Continue
         checkboxes = await page.query_selector_all("input[type='checkbox']")
-        logger.info(f"Found {len(checkboxes)} checkboxes")
-
         if len(checkboxes) > 0:
-            # Check "All" checkbox if present, otherwise check all individual ones
-            all_checkbox = await page.query_selector("input[type='checkbox'][id*='All'], input[type='checkbox'][name*='All']")
-            if all_checkbox:
-                await all_checkbox.check()
-                logger.info("Checked 'All' checkbox")
+            logger.info(f"Address selection: {len(checkboxes)} checkboxes")
+            # Click the "All" checkbox
+            all_cb = None
+            for cb in checkboxes:
+                cb_id = (await cb.get_attribute("id") or "").lower()
+                cb_name = (await cb.get_attribute("name") or "").lower()
+                if "all" in cb_id or "all" in cb_name:
+                    all_cb = cb
+                    break
+            if all_cb:
+                await all_cb.check()
             else:
-                # Check all checkboxes (skip the header "All" one if it exists)
                 for cb in checkboxes:
-                    try:
-                        cb_id = await cb.get_attribute("id") or ""
-                        cb_name = await cb.get_attribute("name") or ""
-                        if "all" not in cb_id.lower() and "all" not in cb_name.lower():
-                            await cb.check()
-                    except:
-                        pass
-                logger.info(f"Checked {len(checkboxes)} individual checkboxes")
+                    await cb.check()
 
-            # Click Continue button
-            continue_btn = None
-            for selector in ["input[value='Continue']", "input[value='continue']", "a[href*='Continue']"]:
-                continue_btn = await page.query_selector(selector)
-                if continue_btn:
+            # Click Continue
+            btns = await page.query_selector_all("input[type='button'], input[type='submit'], input[value='Continue'], a")
+            for btn in btns:
+                text = (await btn.get_attribute("value") or await btn.inner_text() or "").strip().lower()
+                if "continue" in text:
+                    await btn.click()
+                    break
+            await asyncio.sleep(3)
+
+        logger.info(f"Results page: {page.url}")
+
+        # 6. Collect ALL records across all pages
+        all_records = []
+        page_num = 1
+        while True:
+            records = await self._parse_results_page(page)
+            logger.info(f"Page {page_num}: {len(records)} records")
+            all_records.extend(records)
+
+            # Check for next page
+            next_link = await page.query_selector("a[href*='Page=2'], a[href*='Page=3'], a:has-text('2'), a:has-text('Next')")
+            # More reliable: look for page number links at bottom
+            page_links = await page.query_selector_all("a")
+            next_page_link = None
+            for lnk in page_links:
+                txt = (await lnk.inner_text()).strip()
+                if txt == str(page_num + 1):
+                    next_page_link = lnk
                     break
 
-            if not continue_btn:
-                # Find by text
-                buttons = await page.query_selector_all("input[type='button'], input[type='submit'], button, a")
-                for btn in buttons:
-                    text = (await btn.get_attribute("value") or await btn.inner_text() or "").lower()
-                    if "continue" in text:
-                        continue_btn = btn
-                        break
-
-            if continue_btn:
-                logger.info("Clicking Continue...")
-                await continue_btn.click()
+            if next_page_link:
+                logger.info(f"Going to page {page_num + 1}")
+                await next_page_link.click()
                 await asyncio.sleep(3)
-                logger.info(f"After Continue URL: {page.url}")
+                page_num += 1
             else:
-                logger.warning("No Continue button found")
+                break
 
-        # Step 6: Now parse the actual document results
-        return await self._parse_document_results(page, raw_address)
+        logger.info(f"Total records found: {len(all_records)}")
 
-    async def _parse_document_results(self, page, raw_address):
-        content = await page.content()
-        url = page.url
-        logger.info(f"Document results URL: {url}")
-
-        if any(p in content.lower() for p in ["no records found", "no results", "0 record"]):
-            return {"address": raw_address, "total_records": 0, "records": [], "attachments": [], "summary": "No records found."}
-
-        # Parse result rows from all frames
-        records = []
-        for frame in page.frames:
-            rows = await frame.query_selector_all("table tr")
-            for row in rows[1:]:
-                cells = await row.query_selector_all("td")
-                if len(cells) < 2:
-                    continue
-                cell_texts = [(await c.inner_text()).strip() for c in cells]
-                if not any(cell_texts):
-                    continue
-                link = await row.query_selector("a")
-                href = await link.get_attribute("href") if link else None
-                if href:
-                    full_url = href if href.startswith("http") else f"{BASE_URL}/{href.lstrip('/')}"
-                    records.append({"raw_cells": cell_texts, "link": full_url})
-
-        logger.info(f"Found {len(records)} document records")
-
-        if len(records) == 0:
+        if not all_records:
             return {
                 "address": raw_address,
                 "total_records": 0,
                 "records": [],
                 "attachments": [],
                 "summary": "No records found.",
-                "debug_url": url,
-                "debug_snippet": content[:2000],
             }
 
-        detailed_records = []
-        all_attachments = []
+        # 7. Get cookies for authenticated requests
+        cookies = await page.context.cookies()
+        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-        for i, rec in enumerate(records[:50]):
+        # 8. Scrape each record detail
+        detailed = []
+        for i, rec in enumerate(all_records):
+            logger.info(f"Scraping record {i+1}/{len(all_records)}: {rec.get('doc_type')} {rec.get('doc_number')}")
             try:
-                detail = await self._scrape_detail(page, rec["link"], rec["raw_cells"])
-                detailed_records.append(detail)
-                all_attachments.extend(detail.get("attachments", []))
+                detail = await self._scrape_record(page, rec, cookie_str)
+                detailed.append(detail)
             except Exception as e:
-                logger.warning(f"Failed record {i+1}: {e}")
-                detailed_records.append({"raw": rec["raw_cells"], "link": rec["link"], "error": str(e), "attachments": []})
+                logger.warning(f"Record {i+1} failed: {e}")
+                rec["error"] = str(e)
+                detailed.append(rec)
+
+        all_attachments = []
+        for d in detailed:
+            all_attachments.extend(d.get("attachments", []))
 
         return {
             "address": raw_address,
-            "total_records": len(detailed_records),
-            "records": detailed_records,
+            "total_records": len(detailed),
+            "records": detailed,
             "attachments": all_attachments,
-            "summary": self._build_summary(detailed_records, raw_address),
+            "summary": self._build_summary(detailed, raw_address),
         }
 
-    async def _scrape_detail(self, page, url, raw_cells):
-        await self._goto(page, url)
-        detail = {"url": url, "raw_cells": raw_cells, "attachments": []}
+    async def _parse_results_page(self, page):
+        records = []
+        rows = await page.query_selector_all("table tr")
+        for row in rows[1:]:  # skip header
+            cells = await row.query_selector_all("td")
+            if len(cells) < 4:
+                continue
 
+            # Col 0: checkbox, Col 1: Doc Type link, Col 2: Sub Type, Col 3: Doc Date, Col 4: Doc Number, Col 5: Digital Image
+            doc_type_cell = cells[1] if len(cells) > 1 else None
+            sub_type_cell = cells[2] if len(cells) > 2 else None
+            doc_date_cell = cells[3] if len(cells) > 3 else None
+            doc_number_cell = cells[4] if len(cells) > 4 else None
+            digital_image_cell = cells[5] if len(cells) > 5 else None
+
+            doc_type_link = await doc_type_cell.query_selector("a") if doc_type_cell else None
+            doc_type = (await doc_type_link.inner_text()).strip() if doc_type_link else ""
+            doc_type_href = await doc_type_link.get_attribute("href") if doc_type_link else None
+
+            sub_type = (await sub_type_cell.inner_text()).strip() if sub_type_cell else ""
+            doc_date = (await doc_date_cell.inner_text()).strip() if doc_date_cell else ""
+            doc_number = (await doc_number_cell.inner_text()).strip() if doc_number_cell else ""
+
+            # Digital image link
+            digital_img_link = await digital_image_cell.query_selector("a, img") if digital_image_cell else None
+            digital_img_href = None
+            if digital_img_link:
+                digital_img_href = await digital_img_link.get_attribute("href") or await digital_img_link.get_attribute("src")
+
+            if not doc_type:
+                continue
+
+            rec = {
+                "doc_type": doc_type,
+                "sub_type": sub_type,
+                "doc_date": doc_date,
+                "doc_number": doc_number,
+                "detail_url": (f"{BASE_URL}/{doc_type_href.lstrip('/')}" if doc_type_href and not doc_type_href.startswith("http") else doc_type_href),
+                "digital_image_url": (f"{BASE_URL}/{digital_img_href.lstrip('/')}" if digital_img_href and not digital_img_href.startswith("http") else digital_img_href),
+                "attachments": [],
+            }
+            records.append(rec)
+
+        return records
+
+    async def _scrape_record(self, page, rec, cookie_str):
+        if not rec.get("detail_url"):
+            return rec
+
+        await self._goto(page, rec["detail_url"])
+
+        # Extract all detail fields
         field_map = {
-            "doc_type": ["document type", "doc type"],
-            "doc_number": ["document number", "permit number"],
-            "doc_date": ["document date", "date"],
             "status": ["status"],
             "project_name": ["project name"],
-            "address": ["property address"],
+            "address": ["property address", "address"],
             "council_district": ["council district"],
+            "census_tract": ["census tract"],
+            "applicant": ["applicant"],
+            "contractor": ["contractor"],
+            "description": ["description", "work description"],
         }
 
-        for frame in page.frames:
-            rows = await frame.query_selector_all("table tr")
-            for row in rows:
-                cells = await row.query_selector_all("td")
-                if len(cells) >= 2:
-                    label = (await cells[0].inner_text()).strip().lower().rstrip(":")
-                    value = (await cells[1].inner_text()).strip()
-                    for field, keywords in field_map.items():
-                        if any(k in label for k in keywords) and field not in detail:
-                            detail[field] = value
+        rows = await page.query_selector_all("table tr")
+        for row in rows:
+            cells = await row.query_selector_all("td")
+            if len(cells) >= 2:
+                label = (await cells[0].inner_text()).strip().lower().rstrip(":")
+                value = (await cells[1].inner_text()).strip()
+                for field, keywords in field_map.items():
+                    if any(k in label for k in keywords) and field not in rec:
+                        rec[field] = value
 
-            links = await frame.query_selector_all("a")
-            for link in links:
-                href = await link.get_attribute("href") or ""
-                text = (await link.inner_text()).strip()
-                if any(k in href.lower() for k in [".pdf", "viewimage", "download"]) or \
-                   any(k in text.lower() for k in ["view image", "digital image", "view pdf"]):
-                    full_url = href if href.startswith("http") else f"{BASE_URL}/{href.lstrip('/')}"
-                    if href and full_url not in [a["url"] for a in detail["attachments"]]:
-                        detail["attachments"].append({"label": text or "Attachment", "url": full_url})
+        # Find any additional digital image links on detail page
+        links = await page.query_selector_all("a")
+        for link in links:
+            href = await link.get_attribute("href") or ""
+            text = (await link.inner_text()).strip()
+            if any(k in text.lower() for k in ["view image", "digital image", "view document"]) or \
+               any(k in href.lower() for k in ["viewimage", "getimage", "showimage"]):
+                full_url = href if href.startswith("http") else f"{BASE_URL}/{href.lstrip('/')}"
+                if full_url not in [a["url"] for a in rec["attachments"]]:
+                    rec["attachments"].append({"label": text or "Digital Image", "url": full_url, "type": "digital_image"})
 
-        return detail
+        # Add the digital image from results page if present
+        if rec.get("digital_image_url") and rec["digital_image_url"] not in [a["url"] for a in rec["attachments"]]:
+            rec["attachments"].append({
+                "label": f"Digital Image - {rec['doc_type']} {rec['doc_number']}",
+                "url": rec["digital_image_url"],
+                "type": "digital_image"
+            })
+
+        return rec
 
     def _build_summary(self, records, address):
         if not records:
