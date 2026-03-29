@@ -21,7 +21,7 @@ class LADBSScraper:
 
     async def scrape(self, address: str) -> dict:
         number, street_name = parse_address(address)
-        logger.info(f"Parsed address: number={number}, street={street_name}")
+        logger.info(f"Parsed: number={number}, street={street_name}")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -50,46 +50,80 @@ class LADBSScraper:
     async def _run_search(self, page, number, street_name, raw_address):
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
 
-        inputs = await page.query_selector_all("input[type='text']")
-        logger.info(f"Found {len(inputs)} text inputs")
+        # Inspect ALL inputs on the page so we know exact field names
+        all_inputs = await page.query_selector_all("input, select")
+        input_info = []
+        for inp in all_inputs:
+            info = {
+                "tag": await inp.evaluate("el => el.tagName"),
+                "type": await inp.get_attribute("type"),
+                "id": await inp.get_attribute("id"),
+                "name": await inp.get_attribute("name"),
+                "value": await inp.get_attribute("value"),
+            }
+            input_info.append(info)
+            logger.info(f"FIELD: {info}")
 
-        filled = await self._fill_form(page, number, street_name)
+        # Try to fill using exact field inspection
+        filled = await self._fill_form(page, number, street_name, input_info)
         if not filled:
-            raise RuntimeError("Could not fill address form")
+            # Return debug info so we can see the form structure
+            return {
+                "address": raw_address,
+                "error": "Could not fill address form",
+                "debug_fields": input_info,
+                "page_url": page.url,
+                "page_content_snippet": (await page.content())[:2000],
+            }
 
         submit = await self._find_submit(page)
         if not submit:
-            raise RuntimeError("Could not find submit button")
+            return {"address": raw_address, "error": "No submit button found", "debug_fields": input_info}
 
         await submit.click()
         await asyncio.sleep(3)
 
         return await self._parse_results(page, raw_address)
 
-    async def _fill_form(self, page, number, street_name):
-        inputs = await page.query_selector_all("input[type='text']")
+    async def _fill_form(self, page, number, street_name, input_info):
+        # Try by known LADBS ASP.NET field name patterns
         filled_number = False
         filled_name = False
 
-        for inp in inputs:
+        text_inputs = await page.query_selector_all("input[type='text']")
+        logger.info(f"Text inputs count: {len(text_inputs)}")
+
+        for inp in text_inputs:
             field_id = (await inp.get_attribute("id") or "").lower()
             field_name = (await inp.get_attribute("name") or "").lower()
-            combined = field_id + field_name
+            combined = field_id + " " + field_name
+            logger.info(f"Checking field: id={field_id} name={field_name}")
 
-            if any(k in combined for k in ["begno", "beg_no", "stno", "streetno", "houseno", "number"]):
+            # Street number patterns
+            if any(k in combined for k in ["begno", "beg_no", "stno", "streetno", "houseno", "strno", "hno", "txtbegno", "txtno"]):
                 await inp.fill(number)
+                logger.info(f"Filled number into {field_id}")
                 filled_number = True
-            elif any(k in combined for k in ["streetname", "street_name", "strname", "name"]):
+
+            # Street name patterns
+            elif any(k in combined for k in ["streetname", "street_name", "strname", "txtstreet", "txtname", "stnm", "stname"]):
                 await inp.fill(street_name)
+                logger.info(f"Filled street name into {field_id}")
                 filled_name = True
 
         if filled_number and filled_name:
             return True
 
-        if len(inputs) >= 2:
-            await inputs[0].fill(number)
-            await inputs[1].fill(street_name)
-            logger.info("Filled by position fallback")
+        # Fallback: if exactly 2+ text inputs, assume first=number, second=name
+        if len(text_inputs) >= 2 and not filled_number and not filled_name:
+            await text_inputs[0].fill(number)
+            await text_inputs[1].fill(street_name)
+            logger.info("Filled by position (fallback)")
+            return True
+
+        # Partial fill fallback
+        if len(text_inputs) == 1:
+            await text_inputs[0].fill(f"{number} {street_name}")
             return True
 
         return False
@@ -105,9 +139,9 @@ class LADBSScraper:
 
     async def _parse_results(self, page, raw_address):
         content = await page.content()
-        logger.info(f"Results page URL: {page.url}")
+        logger.info(f"Results URL: {page.url}")
 
-        if any(phrase in content.lower() for phrase in ["no records found", "no results", "0 record"]):
+        if any(p in content.lower() for p in ["no records found", "no results", "0 record"]):
             return {"address": raw_address, "total_records": 0, "records": [], "attachments": [], "summary": "No records found."}
 
         records = []
@@ -124,7 +158,7 @@ class LADBSScraper:
                 "link": f"{BASE_URL}/{href}" if href and not href.startswith("http") else href,
             })
 
-        logger.info(f"Parsed {len(records)} raw records")
+        logger.info(f"Found {len(records)} records")
 
         detailed_records = []
         all_attachments = []
