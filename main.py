@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -11,19 +12,16 @@ app = FastAPI(title="LADBS Scraper API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Lock this down to your Replit domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 class ScrapeRequest(BaseModel):
-    address: str  # e.g. "2100 Cypress Ave, Los Angeles, CA 90065"
+    address: str
 
-class HealthResponse(BaseModel):
-    status: str
-
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 def health():
     return {"status": "ok"}
 
@@ -37,3 +35,13 @@ async def scrape(request: ScrapeRequest):
     except Exception as e:
         logger.error(f"Scrape failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+```
+
+And update `Dockerfile` last line to:
+```
+CMD ["python", "main.py"]
