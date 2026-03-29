@@ -141,22 +141,26 @@ class LADBSScraper:
                     await cb.check()
                 except: pass
 
-            # Click continue/search button
             continue_btn = await page.query_selector("input[name='btnSearch'], input[value='Continue']")
             if continue_btn:
                 await continue_btn.click()
                 await asyncio.sleep(4)
             logger.info(f"After continue: {page.url}")
 
-        # Step 4: Parse results — we're now on the DocumentSearch results page
-        # Use the browser's actual rendered HTML
+        # Step 4: Parse results
         html = await page.content()
         logger.info(f"Results HTML length: {len(html)}")
+
+        # Debug: show what's around grdIdisResult
+        idx = html.find("grdIdisResult")
+        logger.info(f"grdIdisResult position: {idx}")
+        if idx >= 0:
+            logger.info(f"Grid context: {html[max(0,idx-50):idx+200]}")
 
         all_records = parse_results_html(html)
         logger.info(f"Page 1: {len(all_records)} records")
 
-        # Step 5: Handle pagination — click page 2, 3 etc
+        # Step 5: Handle pagination
         soup = BeautifulSoup(html, "html.parser")
         page_nav = soup.find("div", id="pnlNavigate")
         if page_nav:
@@ -166,7 +170,6 @@ class LADBSScraper:
                 if pg_text.isdigit() and int(pg_text) > 1:
                     logger.info(f"Navigating to page {pg_text}...")
                     try:
-                        # Use JavaScript to call goPage
                         await page.evaluate(f"goPage('{pg_text}')")
                         await asyncio.sleep(4)
                         pg_html = await page.content()
@@ -187,7 +190,7 @@ class LADBSScraper:
                 "summary": "No records found.",
             }
 
-        # Step 6: Scrape detail pages using the same browser session
+        # Step 6: Scrape detail pages
         detailed = []
         all_attachments = []
 
@@ -197,9 +200,8 @@ class LADBSScraper:
                 await self._goto(page, rec["detail_url"])
                 detail_html = await page.content()
 
-                # Check for session expired
                 if "SessionExpired" in page.url or "IdisError" in page.url:
-                    logger.warning(f"Session expired on detail {i+1}, skipping")
+                    logger.warning(f"Session expired on detail {i+1}")
                     rec["detail_error"] = "Session expired"
                 else:
                     detail = self._parse_detail_html(detail_html)
@@ -222,8 +224,6 @@ class LADBSScraper:
     def _parse_detail_html(self, html: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
         detail = {}
-
-        # Extract bold label: value pairs
         for b_tag in soup.find_all("b"):
             label = b_tag.get_text(strip=True).rstrip(":")
             next_sib = b_tag.next_sibling
@@ -232,7 +232,6 @@ class LADBSScraper:
                 if value and value.lower() != "none":
                     key = label.lower().replace(" ", "_")
                     detail[key] = value
-
         return detail
 
     def _build_summary(self, records, address):
