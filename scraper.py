@@ -21,109 +21,88 @@ def parse_address(raw: str):
     name = tokens[1] if len(tokens) > 1 else ""
     return number, name
 
-def extract_open_window_id(href: str):
-    """Extract document ID from JavaScript:OpenWindow('12345',...) calls."""
-    m = re.search(r"OpenWindow\('(\d+)'", href, re.IGNORECASE)
-    return m.group(1) if m else None
-
-def build_viewer_url(doc_id: str, guid: str = None):
-    """Build the viewer URL for a digital image."""
-    if guid:
-        return f"{BASE_URL}/ViewReport.aspx?rpt=DocumentView&DocID={doc_id}"
-    return f"{BASE_URL}/ViewReport.aspx?rpt=DocumentView&DocID={doc_id}"
-
 def parse_results_html(html: str) -> list:
-    """Parse the document results table from raw HTML using BeautifulSoup."""
+    """
+    Parse the document results table from raw HTML.
+    Each row has:
+    - OpenWindow('RECORD_ID', 'Hidden'/'Visible', 'GUID') on all links
+    - Hidden input with comments: grdIdisResult_hidComments_N
+    - Digital image link: OpenDocument('{GUID},') — only visible if image exists
+    """
     soup = BeautifulSoup(html, "html.parser")
     records = []
 
-    # Find all rows that contain document type links
-    # Real data rows have a link with href containing "DocumentReport" or "lnkDocType"
-    # or href that goes to a document detail page
-    all_rows = soup.find_all("tr")
+    # Find the results grid table
+    grid = soup.find("table", id="grdIdisResult")
+    if not grid:
+        logger.warning("grdIdisResult table not found")
+        # Try fallback: any table with OpenWindow links
+        all_links = soup.find_all("a", href=re.compile(r"OpenWindow", re.I))
+        logger.info(f"Found {len(all_links)} OpenWindow links")
+        return records
 
-    for row in all_rows:
+    rows = grid.find_all("tr")
+    logger.info(f"Grid rows: {len(rows)}")
+
+    for i, row in enumerate(rows[1:]):  # skip header
         cells = row.find_all("td")
         if len(cells) < 5:
             continue
 
-        # The results table has these columns:
-        # [checkbox] [Document Type link] [Sub Type link] [Doc Date link] [User Doc Number link] [Digital Image link/img]
-        # We identify real rows by: cell[1] contains an <a> whose text looks like a document type
-
-        doc_type_cell = cells[1] if len(cells) > 1 else None
-        sub_type_cell = cells[2] if len(cells) > 2 else None
-        doc_date_cell = cells[3] if len(cells) > 3 else None
-        doc_number_cell = cells[4] if len(cells) > 4 else None
-        digital_image_cell = cells[5] if len(cells) > 5 else None
-
-        if not doc_type_cell:
+        # Extract record ID and image GUID from OpenWindow call in first link
+        doc_link = cells[1].find("a")
+        if not doc_link:
             continue
 
-        # Get doc type link
-        doc_type_link = doc_type_cell.find("a")
-        if not doc_type_link:
+        href = doc_link.get("href", "")
+        # Match: OpenWindow('RECORD_ID', 'Hidden'/'Visible', 'GUID')
+        m = re.search(r"OpenWindow\('(\d+)','(Hidden|Visible)','([^']*)'\)", href, re.I)
+        if not m:
             continue
 
-        doc_type = doc_type_link.get_text(strip=True)
-        doc_type_href = doc_type_link.get("href", "")
+        record_id = m.group(1)
+        image_visible = m.group(2) == "Visible"
+        image_guid = m.group(3)
 
-        # Filter out non-data rows - real doc types are things like "BUILDING PERMIT", "CERTIFICATE OF OCCUPANCY" etc.
-        # They should NOT be navigation/UI text
-        skip_words = ["document type", "sort by", "then by", "sub type", "doc date", "doc number",
-                      "ascending", "descending", "all", "printer", "address", "legal", "assessor"]
-        if any(skip in doc_type.lower() for skip in skip_words):
-            continue
-        if len(doc_type) < 3:
-            continue
+        doc_type = doc_link.get_text(strip=True)
+        sub_type = cells[2].get_text(strip=True) if len(cells) > 2 else ""
+        doc_date = cells[3].get_text(strip=True) if len(cells) > 3 else ""
+        doc_number = cells[4].get_text(strip=True) if len(cells) > 4 else ""
 
-        # Build detail URL
-        detail_url = None
-        if doc_type_href and not doc_type_href.lower().startswith("javascript"):
-            detail_url = doc_type_href if doc_type_href.startswith("http") else f"{BASE_URL}/{doc_type_href.lstrip('/')}"
+        # Extract comments from hidden input
+        comment_input = row.find("input", id=re.compile(r"hidComments"))
+        comments = comment_input.get("value", "") if comment_input else ""
 
-        # Get sub type
-        sub_type_link = sub_type_cell.find("a") if sub_type_cell else None
-        sub_type = sub_type_link.get_text(strip=True) if sub_type_link else (sub_type_cell.get_text(strip=True) if sub_type_cell else "")
-
-        # Get doc date
-        doc_date_link = doc_date_cell.find("a") if doc_date_cell else None
-        doc_date = doc_date_link.get_text(strip=True) if doc_date_link else (doc_date_cell.get_text(strip=True) if doc_date_cell else "")
-
-        # Get doc number
-        doc_number_link = doc_number_cell.find("a") if doc_number_cell else None
-        doc_number = doc_number_link.get_text(strip=True) if doc_number_link else (doc_number_cell.get_text(strip=True) if doc_number_cell else "")
-
-        # Get digital image
+        # Digital image URL — only if Visible
         digital_image_url = None
-        digital_image_doc_id = None
-        if digital_image_cell:
-            img_link = digital_image_cell.find("a")
-            if img_link:
-                img_href = img_link.get("href", "")
-                doc_id = extract_open_window_id(img_href)
-                if doc_id:
-                    digital_image_doc_id = doc_id
-                    digital_image_url = f"{BASE_URL}/ViewReport.aspx?rpt=DocumentView&DocID={doc_id}"
+        if image_visible and image_guid:
+            digital_image_url = f"{BASE_URL}/ImageMain.aspx?DocIds={image_guid}"
 
-        # Also check doc_type link for detail URL from doc_number link
-        if not detail_url and doc_number_link:
-            dn_href = doc_number_link.get("href", "")
-            if dn_href and not dn_href.lower().startswith("javascript"):
-                detail_url = dn_href if dn_href.startswith("http") else f"{BASE_URL}/{dn_href.lstrip('/')}"
+        # Detail page URL
+        detail_url = f"{BASE_URL}/Report.aspx?Record_Id={record_id}&Image=Hidden&ImageToOpen="
 
         record = {
+            "record_id": record_id,
             "doc_type": doc_type,
             "sub_type": sub_type,
             "doc_date": doc_date,
             "doc_number": doc_number,
+            "comments": comments,
             "detail_url": detail_url,
             "digital_image_url": digital_image_url,
-            "digital_image_doc_id": digital_image_doc_id,
+            "has_digital_image": image_visible,
             "attachments": [],
         }
+
+        if digital_image_url:
+            record["attachments"].append({
+                "label": f"Digital Image - {doc_type} {doc_number}",
+                "url": digital_image_url,
+                "type": "digital_image",
+            })
+
         records.append(record)
-        logger.info(f"Parsed record: {doc_type} | {sub_type} | {doc_date} | {doc_number} | img_id={digital_image_doc_id}")
+        logger.info(f"Row {i+1}: {doc_type} | {sub_type} | {doc_date} | {doc_number} | img={image_visible}")
 
     return records
 
@@ -195,7 +174,7 @@ class LADBSScraper:
             "Origin": "https://ladbsdoc.lacity.org",
         }
 
-        # Step 2: POST search
+        # Step 2: POST search form
         post_data = {**hidden,
             "__VIEWSTATE": vs,
             "__VIEWSTATEGENERATOR": vsg,
@@ -208,16 +187,14 @@ class LADBSScraper:
         }
 
         form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR"
-        logger.info(f"POSTing search: number={number} street={street_name}")
+        logger.info(f"POST search: {number} {street_name}")
 
         async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
             resp = await client.post(form_url, data=post_data, headers=headers)
-            logger.info(f"Search POST: {resp.status_code} → {resp.url}")
             html1 = resp.text
             for k, v in resp.cookies.items():
                 cookies[k] = v
 
-        # Load into Playwright to extract form state
         await page.set_content(html1)
         await asyncio.sleep(1)
 
@@ -251,7 +228,6 @@ class LADBSScraper:
 
             async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
                 resp2 = await client.post(form_url, data=post_data2, headers=headers)
-                logger.info(f"Continue POST: {resp2.status_code} → {resp2.url}")
                 results_html = resp2.text
                 results_url = str(resp2.url)
                 for k, v in resp2.cookies.items():
@@ -260,39 +236,53 @@ class LADBSScraper:
             results_html = html1
             results_url = form_url
 
-        logger.info(f"Results page length: {len(results_html)}")
+        logger.info(f"Results page: {results_url}, length: {len(results_html)}")
 
-        # Step 4: Parse ALL pages of results using BeautifulSoup
+        # Step 4: Parse page 1
         all_records = parse_results_html(results_html)
         logger.info(f"Page 1: {len(all_records)} records")
 
-        # Check for page 2, 3, etc.
+        # Step 5: Handle pagination using goPage POST
+        # Check for page 2+ links
         soup = BeautifulSoup(results_html, "html.parser")
-        page_links = soup.find_all("a")
-        page_nums_found = set()
-        for lnk in page_links:
-            txt = lnk.get_text(strip=True)
-            if txt.isdigit() and int(txt) > 1:
-                page_nums_found.add(int(txt))
+        page_nav = soup.find("div", id="pnlNavigate")
+        if page_nav:
+            page_links = page_nav.find_all("a")
+            for pg_link in page_links:
+                pg_text = pg_link.get_text(strip=True)
+                if pg_text.isdigit() and int(pg_text) > 1:
+                    pg_num = int(pg_text)
+                    logger.info(f"Fetching page {pg_num}...")
 
-        logger.info(f"Additional pages found: {page_nums_found}")
+                    # Load results page in Playwright to get its form state
+                    await page.set_content(results_html)
+                    await asyncio.sleep(1)
 
-        # For pagination, load the results in Playwright and click page numbers
-        if page_nums_found:
-            await page.set_content(results_html)
-            await asyncio.sleep(1)
-            for pg in sorted(page_nums_found):
-                try:
-                    pg_link = await page.query_selector(f"a:text('{pg}')")
-                    if pg_link:
-                        await pg_link.click()
-                        await asyncio.sleep(3)
-                        pg_html = await page.content()
-                        pg_records = parse_results_html(pg_html)
-                        logger.info(f"Page {pg}: {len(pg_records)} records")
-                        all_records.extend(pg_records)
-                except Exception as e:
-                    logger.warning(f"Page {pg} failed: {e}")
+                    vs3, vsg3, ev3 = await self._get_viewstate(page)
+                    hidden3 = await self._get_hidden_fields(page)
+
+                    # Update headers referer
+                    headers["Referer"] = results_url
+
+                    post_pg = {**hidden3,
+                        "__VIEWSTATE": vs3,
+                        "__VIEWSTATEGENERATOR": vsg3,
+                        "__EVENTVALIDATION": ev3,
+                        "__EVENTTARGET": "",
+                        "__EVENTARGUMENT": "",
+                        "PageNavigate": "true",
+                        "PageNo": str(pg_num),
+                    }
+
+                    async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
+                        resp_pg = await client.post(results_url, data=post_pg, headers=headers)
+                        pg_html = resp_pg.text
+                        for k, v in resp_pg.cookies.items():
+                            cookies[k] = v
+
+                    pg_records = parse_results_html(pg_html)
+                    logger.info(f"Page {pg_num}: {len(pg_records)} records")
+                    all_records.extend(pg_records)
 
         logger.info(f"Total records: {len(all_records)}")
 
@@ -305,28 +295,18 @@ class LADBSScraper:
                 "summary": "No records found.",
             }
 
-        # Step 5: Scrape detail pages
+        # Step 6: Scrape detail pages for additional info
         detailed = []
         all_attachments = []
 
         for i, rec in enumerate(all_records):
             logger.info(f"Detail {i+1}/{len(all_records)}: {rec['doc_type']} {rec['doc_number']}")
             try:
-                if rec.get("detail_url"):
-                    await self._goto(page, rec["detail_url"])
-                    rec = await self._extract_detail(page, rec)
+                detail = await self._scrape_detail(rec)
+                rec.update(detail)
             except Exception as e:
                 logger.warning(f"Detail {i+1} failed: {e}")
-                rec["error"] = str(e)
-
-            # Add digital image as attachment
-            if rec.get("digital_image_url"):
-                rec["attachments"].append({
-                    "label": f"Digital Image - {rec['doc_type']} {rec['doc_number']}",
-                    "url": rec["digital_image_url"],
-                    "type": "digital_image",
-                    "doc_id": rec.get("digital_image_doc_id"),
-                })
+                rec["detail_error"] = str(e)
 
             detailed.append(rec)
             all_attachments.extend(rec.get("attachments", []))
@@ -339,46 +319,32 @@ class LADBSScraper:
             "summary": self._build_summary(detailed, raw_address),
         }
 
-    async def _extract_detail(self, page, rec):
-        """Extract fields from individual document detail page."""
-        field_map = {
-            "status": ["status"],
-            "project_name": ["project name"],
-            "address": ["property address", "address"],
-            "council_district": ["council district"],
-            "applicant": ["applicant"],
-            "contractor": ["contractor"],
-            "description": ["description", "work description"],
-            "valuation": ["valuation", "value"],
-        }
-        html = await page.content()
-        soup = BeautifulSoup(html, "html.parser")
-        rows = soup.find_all("tr")
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) >= 2:
-                label = cells[0].get_text(strip=True).lower().rstrip(":")
-                value = cells[1].get_text(strip=True)
-                for field, keywords in field_map.items():
-                    if any(k in label for k in keywords) and field not in rec:
-                        rec[field] = value
+    async def _scrape_detail(self, rec: dict) -> dict:
+        """Fetch the detail page and extract structured fields."""
+        detail_url = rec.get("detail_url")
+        if not detail_url:
+            return {}
 
-        # Look for additional digital image links on detail page
-        links = soup.find_all("a")
-        for link in links:
-            href = link.get("href", "")
-            text = link.get_text(strip=True)
-            doc_id = extract_open_window_id(href)
-            if doc_id:
-                viewer_url = f"{BASE_URL}/ViewReport.aspx?rpt=DocumentView&DocID={doc_id}"
-                if viewer_url not in [a["url"] for a in rec["attachments"]]:
-                    rec["attachments"].append({
-                        "label": text or f"Digital Image {doc_id}",
-                        "url": viewer_url,
-                        "type": "digital_image",
-                        "doc_id": doc_id,
-                    })
-        return rec
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+            resp = await client.get(detail_url)
+            html = resp.text
+
+        soup = BeautifulSoup(html, "html.parser")
+        detail = {}
+
+        # The detail page uses <b>Field: </b>value pattern inside <Font> tags
+        # Extract all bold labels and their following text
+        for b_tag in soup.find_all("b"):
+            label_text = b_tag.get_text(strip=True).rstrip(":")
+            # Get the text immediately after the <b> tag
+            next_text = b_tag.next_sibling
+            if next_text and isinstance(next_text, str):
+                value = next_text.strip()
+                if value and value != "None":
+                    key = label_text.lower().replace(" ", "_")
+                    detail[key] = value
+
+        return detail
 
     def _build_summary(self, records, address):
         if not records:
