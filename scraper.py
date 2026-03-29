@@ -31,7 +31,7 @@ class LADBSScraper:
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
             )
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             )
             page = await context.new_page()
             page.set_default_timeout(30000)
@@ -48,228 +48,147 @@ class LADBSScraper:
             logger.warning(f"goto warning: {e}")
         await asyncio.sleep(2)
 
+    async def _get_viewstate(self, page):
+        vs, vsg, ev = "", "", ""
+        try:
+            vs = await page.eval_on_selector("input[name='__VIEWSTATE']", "el => el.value") or ""
+        except: pass
+        try:
+            vsg = await page.eval_on_selector("input[name='__VIEWSTATEGENERATOR']", "el => el.value") or ""
+        except: pass
+        try:
+            ev = await page.eval_on_selector("input[name='__EVENTVALIDATION']", "el => el.value") or ""
+        except: pass
+        return vs, vsg, ev
+
+    async def _get_hidden_fields(self, page):
+        fields = {}
+        hiddens = await page.query_selector_all("input[type='hidden']")
+        for h in hiddens:
+            n = await h.get_attribute("name")
+            v = await h.get_attribute("value") or ""
+            if n:
+                fields[n] = v
+        return fields
+
     async def _run(self, page, context, number, street_name, raw_address):
-        # Step 1: Load main page for session
+        # Step 1: Establish session
         await self._goto(page, MAIN_URL)
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
 
-        # Step 2: Extract ASP.NET form state
-        viewstate = await page.eval_on_selector(
-            "input[name='__VIEWSTATE']", "el => el.value"
-        ) or ""
-        viewstate_gen = await page.eval_on_selector(
-            "input[name='__VIEWSTATEGENERATOR']", "el => el.value"
-        ) or ""
-        event_validation = ""
-        try:
-            event_validation = await page.eval_on_selector(
-                "input[name='__EVENTVALIDATION']", "el => el.value"
-            ) or ""
-        except:
-            pass
+        vs, vsg, ev = await self._get_viewstate(page)
+        hidden = await self._get_hidden_fields(page)
+        cookies = {c["name"]: c["value"] for c in await context.cookies()}
 
-        logger.info(f"VIEWSTATE length: {len(viewstate)}")
-
-        # Step 3: Find all input field names on the form
-        inputs = await page.query_selector_all("input, select")
-        form_fields = {}
-        for inp in inputs:
-            name = await inp.get_attribute("name")
-            val = await inp.get_attribute("value") or ""
-            inp_type = await inp.get_attribute("type") or "text"
-            if name:
-                form_fields[name] = {"type": inp_type, "value": val}
-                logger.info(f"Field: name={name} type={inp_type} value={val[:30]}")
-
-        # Step 4: Find the street number and name field names
-        # Try to identify by examining field names
-        number_field = None
-        name_field = None
-        submit_field = None
-
-        for fname, finfo in form_fields.items():
-            fname_lower = fname.lower()
-            if finfo["type"] in ["text", ""] or finfo["type"] is None:
-                if any(k in fname_lower for k in ["beg", "no", "nbr", "num", "str", "hse", "house"]):
-                    if not number_field:
-                        number_field = fname
-                if any(k in fname_lower for k in ["name", "nm", "street", "str"]):
-                    if not name_field:
-                        name_field = fname
-            if finfo["type"] in ["submit", "button", "image"]:
-                submit_field = fname
-
-        logger.info(f"Guessed: number_field={number_field}, name_field={name_field}, submit={submit_field}")
-
-        # Step 5: Build POST data
-        post_data = {
-            "__VIEWSTATE": viewstate,
-            "__VIEWSTATEGENERATOR": viewstate_gen,
-        }
-        if event_validation:
-            post_data["__EVENTVALIDATION"] = event_validation
-
-        # Add all hidden fields
-        for fname, finfo in form_fields.items():
-            if finfo["type"] == "hidden":
-                post_data[fname] = finfo["value"]
-
-        # Set address fields
-        if number_field:
-            post_data[number_field] = number
-        if name_field:
-            post_data[name_field] = street_name
-        if submit_field:
-            post_data[submit_field] = form_fields[submit_field]["value"]
-
-        # Step 6: Get cookies from browser session
-        cookies = await context.cookies()
-        cookie_dict = {c["name"]: c["value"] for c in cookies}
-
-        # Step 7: POST the form using httpx with browser cookies
-        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR"
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": form_url,
+            "Referer": f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Origin": "https://ladbsdoc.lacity.org",
         }
 
-        logger.info(f"POSTing to: {form_url}")
-        logger.info(f"POST fields: { {k: v[:20] if isinstance(v, str) and len(v) > 20 else v for k, v in post_data.items()} }")
+        # Step 2: POST search form with correct fields
+        # From logs we know exact field names:
+        # Address$txtAddressBegNo, Address$txtAddressStreetName, btnNext1
+        post_data = {**hidden,
+            "__VIEWSTATE": vs,
+            "__VIEWSTATEGENERATOR": vsg,
+            "__EVENTVALIDATION": ev,
+            "__EVENTTARGET": "",
+            "__EVENTARGUMENT": "",
+            "Address$txtAddressBegNo": number,
+            "Address$txtAddressStreetName": street_name,
+            "btnNext1": "Next",  # This is the correct submit button
+        }
 
-        async with httpx.AsyncClient(cookies=cookie_dict, follow_redirects=True, timeout=30) as client:
+        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR"
+        logger.info(f"POSTing search: number={number} street={street_name}")
+
+        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
             resp = await client.post(form_url, data=post_data, headers=headers)
-            logger.info(f"POST response: {resp.status_code} → {resp.url}")
-            html = resp.text
+            logger.info(f"Search POST: {resp.status_code} → {resp.url}")
+            html1 = resp.text
+            # Update cookies
+            for k, v in resp.cookies.items():
+                cookies[k] = v
 
-        # Step 8: Load the response into Playwright for parsing
-        await page.set_content(html)
+        # Load into Playwright
+        await page.set_content(html1)
         await asyncio.sleep(1)
+        logger.info(f"Page 1 content length: {len(html1)}")
 
-        current_url = str(resp.url)
-        logger.info(f"Result page URL: {current_url}")
-        logger.info(f"Result HTML snippet: {html[:500]}")
-
-        # Step 9: Handle address selection or results
-        return await self._handle_page(page, context, cookie_dict, headers, current_url, raw_address, html)
-
-    async def _handle_page(self, page, context, cookie_dict, headers, current_url, raw_address, html):
-        # Check if this is address selection page (has checkboxes in a table)
+        # Step 3: Handle address selection page (checkboxes)
         checkboxes = await page.query_selector_all("input[type='checkbox']")
         logger.info(f"Checkboxes found: {len(checkboxes)}")
 
-        if len(checkboxes) > 1:
-            logger.info("Address selection page detected")
-            # Get all checkbox values (parcel IDs)
-            cb_values = []
+        if len(checkboxes) > 0:
+            vs2, vsg2, ev2 = await self._get_viewstate(page)
+            hidden2 = await self._get_hidden_fields(page)
+
+            # Collect all checkbox names/values
+            cb_data = {}
             for cb in checkboxes:
-                cb_name = await cb.get_attribute("name")
-                cb_val = await cb.get_attribute("value")
-                if cb_name and cb_val and "all" not in (cb_name or "").lower():
-                    cb_values.append((cb_name, cb_val))
-                    logger.info(f"Checkbox: name={cb_name} value={cb_val}")
+                cb_name = await cb.get_attribute("name") or ""
+                cb_val = await cb.get_attribute("value") or ""
+                if cb_name and "all" not in cb_name.lower():
+                    cb_data[cb_name] = cb_val
+                    logger.info(f"CB: {cb_name}={cb_val}")
 
-            # Get viewstate from this page
-            viewstate = ""
-            viewstate_gen = ""
-            try:
-                viewstate = await page.eval_on_selector("input[name='__VIEWSTATE']", "el => el.value") or ""
-                viewstate_gen = await page.eval_on_selector("input[name='__VIEWSTATEGENERATOR']", "el => el.value") or ""
-            except:
-                pass
-
-            # Find continue button
-            continue_btn = await page.query_selector("input[value='Continue'], input[value='continue']")
+            # Find continue button name
+            continue_btn = await page.query_selector("input[value='Continue']")
             continue_name = await continue_btn.get_attribute("name") if continue_btn else "btnContinue"
-            continue_val = await continue_btn.get_attribute("value") if continue_btn else "Continue"
+            logger.info(f"Continue button: {continue_name}")
 
-            # Build POST for continue
-            post_data = {
-                "__VIEWSTATE": viewstate,
-                "__VIEWSTATEGENERATOR": viewstate_gen,
-                continue_name: continue_val,
+            post_data2 = {**hidden2,
+                "__VIEWSTATE": vs2,
+                "__VIEWSTATEGENERATOR": vsg2,
+                "__EVENTVALIDATION": ev2,
+                "__EVENTTARGET": "",
+                "__EVENTARGUMENT": "",
+                continue_name: "Continue",
+                **cb_data,
             }
-            # Add all checkboxes
-            for cb_name, cb_val in cb_values:
-                post_data[cb_name] = cb_val
 
-            # Also add hidden fields
-            hiddens = await page.query_selector_all("input[type='hidden']")
-            for h in hiddens:
-                n = await h.get_attribute("name")
-                v = await h.get_attribute("value") or ""
-                if n and n not in post_data:
-                    post_data[n] = v
+            logger.info(f"POSTing continue with {len(cb_data)} checkboxes")
+            async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
+                resp2 = await client.post(form_url, data=post_data2, headers=headers)
+                logger.info(f"Continue POST: {resp2.status_code} → {resp2.url}")
+                html2 = resp2.text
+                for k, v in resp2.cookies.items():
+                    cookies[k] = v
 
-            selection_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR"
-            logger.info(f"POSTing continue to: {selection_url}")
-
-            async with httpx.AsyncClient(cookies=cookie_dict, follow_redirects=True, timeout=30) as client:
-                resp = await client.post(selection_url, data=post_data, headers=headers)
-                logger.info(f"Continue response: {resp.status_code} → {resp.url}")
-                html = resp.text
-
-            await page.set_content(html)
+            await page.set_content(html2)
             await asyncio.sleep(1)
-            logger.info(f"After continue HTML snippet: {html[:500]}")
+            logger.info(f"After continue content length: {len(html2)}")
 
-        # Now parse the actual results
-        return await self._parse_results(page, context, cookie_dict, headers, raw_address)
+        # Step 4: Parse document results across all pages
+        all_records = []
+        page_num = 1
+        while True:
+            records = await self._parse_results_page(page)
+            logger.info(f"Page {page_num}: {len(records)} records")
+            all_records.extend(records)
 
-    async def _parse_results(self, page, context, cookie_dict, headers, raw_address):
-        content = await page.content()
-        logger.info(f"Parsing results, content length: {len(content)}")
-
-        if any(p in content.lower() for p in ["no records found", "no results", "0 record"]):
-            return {"address": raw_address, "total_records": 0, "records": [], "attachments": [], "summary": "No records found."}
-
-        records = []
-        rows = await page.query_selector_all("table tr")
-        logger.info(f"Table rows: {len(rows)}")
-
-        for row in rows:
-            cells = await row.query_selector_all("td")
-            if len(cells) < 4:
-                continue
-            cell_texts = [(await c.inner_text()).strip() for c in cells]
-            logger.info(f"Row: {cell_texts[:5]}")
-
-            # Find doc type link
-            links = await row.query_selector_all("a")
-            doc_link = None
-            img_link = None
-
+            # Check for next page link
+            next_link = None
+            links = await page.query_selector_all("a")
             for lnk in links:
-                href = await lnk.get_attribute("href") or ""
-                text = (await lnk.inner_text()).strip()
-                src = await lnk.query_selector("img")
-                if src:
-                    img_link = href
-                elif text:
-                    doc_link = href
+                txt = (await lnk.inner_text()).strip()
+                if txt == str(page_num + 1):
+                    next_link = lnk
+                    break
 
-            if not cell_texts[0] and len(cell_texts) > 1:
-                # Skip header/empty rows
-                if not any(cell_texts):
-                    continue
+            if next_link:
+                await next_link.click()
+                await asyncio.sleep(3)
+                page_num += 1
+            else:
+                break
 
-            rec = {
-                "doc_type": cell_texts[1] if len(cell_texts) > 1 else "",
-                "sub_type": cell_texts[2] if len(cell_texts) > 2 else "",
-                "doc_date": cell_texts[3] if len(cell_texts) > 3 else "",
-                "doc_number": cell_texts[4] if len(cell_texts) > 4 else "",
-                "detail_url": (f"{BASE_URL}/{doc_link.lstrip('/')}" if doc_link and not doc_link.startswith("http") else doc_link),
-                "digital_image_url": (f"{BASE_URL}/{img_link.lstrip('/')}" if img_link and not img_link.startswith("http") else img_link),
-                "attachments": [],
-            }
+        logger.info(f"Total records: {len(all_records)}")
 
-            if rec["doc_type"] and rec["doc_type"] not in ["Document Type", "All"]:
-                records.append(rec)
-
-        logger.info(f"Parsed {len(records)} records")
-
-        if not records:
+        if not all_records:
+            content = await page.content()
             return {
                 "address": raw_address,
                 "total_records": 0,
@@ -279,20 +198,20 @@ class LADBSScraper:
                 "debug_snippet": content[:3000],
             }
 
-        # Scrape detail pages
+        # Step 5: Scrape each detail page
         detailed = []
         all_attachments = []
-        for i, rec in enumerate(records[:50]):
+        for i, rec in enumerate(all_records):
+            logger.info(f"Detail {i+1}/{len(all_records)}: {rec.get('doc_type')} {rec.get('doc_number')}")
             try:
                 if rec.get("detail_url"):
                     await self._goto(page, rec["detail_url"])
                     rec = await self._extract_detail(page, rec)
-                detailed.append(rec)
-                all_attachments.extend(rec.get("attachments", []))
             except Exception as e:
-                logger.warning(f"Record {i+1} detail failed: {e}")
+                logger.warning(f"Detail {i+1} failed: {e}")
                 rec["error"] = str(e)
-                detailed.append(rec)
+            detailed.append(rec)
+            all_attachments.extend(rec.get("attachments", []))
 
         return {
             "address": raw_address,
@@ -301,6 +220,55 @@ class LADBSScraper:
             "attachments": all_attachments,
             "summary": self._build_summary(detailed, raw_address),
         }
+
+    async def _parse_results_page(self, page):
+        records = []
+        rows = await page.query_selector_all("table tr")
+        for row in rows:
+            cells = await row.query_selector_all("td")
+            if len(cells) < 4:
+                continue
+
+            cell_texts = [(await c.inner_text()).strip() for c in cells]
+
+            # Skip header rows
+            if cell_texts[0].lower() in ["", "all"] and any(h in " ".join(cell_texts).lower() for h in ["document type", "doc type", "sub type"]):
+                continue
+
+            # Find doc type link and image link
+            doc_link = None
+            img_link = None
+            for cell in cells:
+                links = await cell.query_selector_all("a")
+                for lnk in links:
+                    href = await lnk.get_attribute("href") or ""
+                    img = await lnk.query_selector("img")
+                    if img:
+                        img_link = href
+                    elif href and not doc_link:
+                        doc_link = href
+
+            # Parse columns: [checkbox, doc_type, sub_type, doc_date, doc_number, digital_image]
+            doc_type = cell_texts[1] if len(cell_texts) > 1 else ""
+            sub_type = cell_texts[2] if len(cell_texts) > 2 else ""
+            doc_date = cell_texts[3] if len(cell_texts) > 3 else ""
+            doc_number = cell_texts[4] if len(cell_texts) > 4 else ""
+
+            if not doc_type or doc_type.lower() in ["document type", "all", ""]:
+                continue
+
+            rec = {
+                "doc_type": doc_type,
+                "sub_type": sub_type,
+                "doc_date": doc_date,
+                "doc_number": doc_number,
+                "detail_url": (f"{BASE_URL}/{doc_link.lstrip('/')}" if doc_link and not doc_link.startswith("http") else doc_link),
+                "digital_image_url": (f"{BASE_URL}/{img_link.lstrip('/')}" if img_link and not img_link.startswith("http") else img_link),
+                "attachments": [],
+            }
+            records.append(rec)
+
+        return records
 
     async def _extract_detail(self, page, rec):
         field_map = {
@@ -322,7 +290,6 @@ class LADBSScraper:
                     if any(k in label for k in keywords) and field not in rec:
                         rec[field] = value
 
-        # Get digital image links
         links = await page.query_selector_all("a")
         for link in links:
             href = await link.get_attribute("href") or ""
