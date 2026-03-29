@@ -5,6 +5,7 @@ from playwright.async_api import async_playwright
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://ladbsdoc.lacity.org/IDISPublic_Records/idis"
+MAIN_URL = "https://ladbsdoc.lacity.org"
 
 def parse_address(raw: str):
     raw = raw.strip()
@@ -39,94 +40,85 @@ class LADBSScraper:
             finally:
                 await browser.close()
 
-    async def _goto(self, page, url):
+    async def _goto(self, page, url, wait="domcontentloaded"):
         logger.info(f"Navigating to: {url}")
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until=wait, timeout=30000)
         except Exception as e:
             logger.warning(f"goto warning: {e}")
         await asyncio.sleep(2)
 
     async def _run_search(self, page, number, street_name, raw_address):
-        await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
+        # Step 1: Hit the main page first to establish a session
+        logger.info("Step 1: Loading main page to establish session...")
+        await self._goto(page, MAIN_URL)
+        logger.info(f"Main page loaded, URL: {page.url}")
 
-        # Inspect ALL inputs on the page so we know exact field names
+        # Step 2: Navigate to parcel search selection
+        logger.info("Step 2: Loading parcel search selection...")
+        await self._goto(page, f"{BASE_URL}/ParcelSearchSelection.aspx")
+        logger.info(f"Parcel selection URL: {page.url}")
+
+        # Step 3: Click the "By Address" link
+        logger.info("Step 3: Clicking By Address link...")
+        try:
+            addr_link = await page.query_selector("a[href*='PRCL_ADDR'], a[href*='ParcelSearch']")
+            if addr_link:
+                await addr_link.click()
+                await asyncio.sleep(2)
+            else:
+                # Navigate directly
+                await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
+        except Exception as e:
+            logger.warning(f"Link click failed, navigating directly: {e}")
+            await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
+
+        logger.info(f"Search form URL: {page.url}")
+
+        # Step 4: Inspect and fill the form
         all_inputs = await page.query_selector_all("input, select")
-        input_info = []
+        logger.info(f"Found {len(all_inputs)} form elements")
         for inp in all_inputs:
             info = {
-                "tag": await inp.evaluate("el => el.tagName"),
                 "type": await inp.get_attribute("type"),
                 "id": await inp.get_attribute("id"),
                 "name": await inp.get_attribute("name"),
-                "value": await inp.get_attribute("value"),
             }
-            input_info.append(info)
             logger.info(f"FIELD: {info}")
 
-        # Try to fill using exact field inspection
-        filled = await self._fill_form(page, number, street_name, input_info)
-        if not filled:
-            # Return debug info so we can see the form structure
+        text_inputs = await page.query_selector_all("input[type='text'], input:not([type])")
+        logger.info(f"Found {len(text_inputs)} text inputs")
+
+        if len(text_inputs) == 0:
+            content = await page.content()
             return {
                 "address": raw_address,
-                "error": "Could not fill address form",
-                "debug_fields": input_info,
-                "page_url": page.url,
-                "page_content_snippet": (await page.content())[:2000],
+                "error": "No text inputs found on search page",
+                "current_url": page.url,
+                "page_snippet": content[:3000],
             }
 
+        # Fill by position — LADBS address search: field 1 = street number, field 2 = street name
+        await text_inputs[0].click()
+        await text_inputs[0].fill(number)
+        logger.info(f"Filled field 0 with number: {number}")
+
+        if len(text_inputs) >= 2:
+            await text_inputs[1].click()
+            await text_inputs[1].fill(street_name)
+            logger.info(f"Filled field 1 with street: {street_name}")
+
+        # Step 5: Submit
         submit = await self._find_submit(page)
         if not submit:
-            return {"address": raw_address, "error": "No submit button found", "debug_fields": input_info}
+            return {"address": raw_address, "error": "No submit button found"}
 
+        logger.info("Submitting form...")
         await submit.click()
-        await asyncio.sleep(3)
+        await asyncio.sleep(4)
 
+        logger.info(f"After submit URL: {page.url}")
         return await self._parse_results(page, raw_address)
-
-    async def _fill_form(self, page, number, street_name, input_info):
-        # Try by known LADBS ASP.NET field name patterns
-        filled_number = False
-        filled_name = False
-
-        text_inputs = await page.query_selector_all("input[type='text']")
-        logger.info(f"Text inputs count: {len(text_inputs)}")
-
-        for inp in text_inputs:
-            field_id = (await inp.get_attribute("id") or "").lower()
-            field_name = (await inp.get_attribute("name") or "").lower()
-            combined = field_id + " " + field_name
-            logger.info(f"Checking field: id={field_id} name={field_name}")
-
-            # Street number patterns
-            if any(k in combined for k in ["begno", "beg_no", "stno", "streetno", "houseno", "strno", "hno", "txtbegno", "txtno"]):
-                await inp.fill(number)
-                logger.info(f"Filled number into {field_id}")
-                filled_number = True
-
-            # Street name patterns
-            elif any(k in combined for k in ["streetname", "street_name", "strname", "txtstreet", "txtname", "stnm", "stname"]):
-                await inp.fill(street_name)
-                logger.info(f"Filled street name into {field_id}")
-                filled_name = True
-
-        if filled_number and filled_name:
-            return True
-
-        # Fallback: if exactly 2+ text inputs, assume first=number, second=name
-        if len(text_inputs) >= 2 and not filled_number and not filled_name:
-            await text_inputs[0].fill(number)
-            await text_inputs[1].fill(street_name)
-            logger.info("Filled by position (fallback)")
-            return True
-
-        # Partial fill fallback
-        if len(text_inputs) == 1:
-            await text_inputs[0].fill(f"{number} {street_name}")
-            return True
-
-        return False
 
     async def _find_submit(self, page):
         for selector in ["input[type='submit']", "input[type='button']", "button[type='submit']", "button"]:
@@ -139,7 +131,11 @@ class LADBSScraper:
 
     async def _parse_results(self, page, raw_address):
         content = await page.content()
-        logger.info(f"Results URL: {page.url}")
+        url = page.url
+        logger.info(f"Results URL: {url}")
+
+        if "error" in url.lower() or "session" in url.lower():
+            return {"address": raw_address, "error": f"Session/error page: {url}", "page_snippet": content[:2000]}
 
         if any(p in content.lower() for p in ["no records found", "no results", "0 record"]):
             return {"address": raw_address, "total_records": 0, "records": [], "attachments": [], "summary": "No records found."}
@@ -148,30 +144,39 @@ class LADBSScraper:
         rows = await page.query_selector_all("table tr")
         for row in rows[1:]:
             cells = await row.query_selector_all("td")
-            if len(cells) < 3:
+            if len(cells) < 2:
                 continue
             cell_texts = [await c.inner_text() for c in cells]
             link = await row.query_selector("a")
             href = await link.get_attribute("href") if link else None
-            records.append({
-                "raw_cells": cell_texts,
-                "link": f"{BASE_URL}/{href}" if href and not href.startswith("http") else href,
-            })
+            if href:
+                full_url = href if href.startswith("http") else f"{BASE_URL}/{href.lstrip('/')}"
+                records.append({"raw_cells": cell_texts, "link": full_url})
 
         logger.info(f"Found {len(records)} records")
+
+        if len(records) == 0:
+            return {
+                "address": raw_address,
+                "total_records": 0,
+                "records": [],
+                "attachments": [],
+                "summary": "No records found.",
+                "debug_url": url,
+                "debug_snippet": content[:2000],
+            }
 
         detailed_records = []
         all_attachments = []
 
         for i, rec in enumerate(records[:50]):
-            if rec.get("link"):
-                try:
-                    detail = await self._scrape_detail(page, rec["link"], rec["raw_cells"])
-                    detailed_records.append(detail)
-                    all_attachments.extend(detail.get("attachments", []))
-                except Exception as e:
-                    logger.warning(f"Failed record {i+1}: {e}")
-                    detailed_records.append({"raw": rec["raw_cells"], "link": rec["link"], "error": str(e), "attachments": []})
+            try:
+                detail = await self._scrape_detail(page, rec["link"], rec["raw_cells"])
+                detailed_records.append(detail)
+                all_attachments.extend(detail.get("attachments", []))
+            except Exception as e:
+                logger.warning(f"Failed record {i+1}: {e}")
+                detailed_records.append({"raw": rec["raw_cells"], "link": rec["link"], "error": str(e), "attachments": []})
 
         return {
             "address": raw_address,
