@@ -112,7 +112,7 @@ class LADBSScraper:
                 await browser.close()
 
     async def _goto(self, page, url):
-        logger.info(f"→ {url}")
+        logger.info(f"-> {url}")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception as e:
@@ -131,7 +131,7 @@ class LADBSScraper:
         await asyncio.sleep(3)
         logger.info(f"After search submit: {page.url}")
 
-        # Step 3: Address selection — check all and continue
+        # Step 3: Address selection - check all and continue
         checkboxes = await page.query_selector_all("input[type='checkbox']:not([id*='CheckAll'])")
         logger.info(f"Address checkboxes: {len(checkboxes)}")
 
@@ -139,28 +139,34 @@ class LADBSScraper:
             for cb in checkboxes:
                 try:
                     await cb.check()
-                except: pass
-
+                except:
+                    pass
             continue_btn = await page.query_selector("input[name='btnSearch'], input[value='Continue']")
             if continue_btn:
                 await continue_btn.click()
                 await asyncio.sleep(4)
             logger.info(f"After continue: {page.url}")
 
-        # Step 4: Parse results
+        # Step 4: Ensure lstAddress is set to "All" to see all records
+        try:
+            lst = await page.query_selector("select[name='lstAddress']")
+            if lst:
+                current_val = await lst.evaluate("el => el.value")
+                logger.info(f"lstAddress value: {current_val}")
+                if current_val != "All":
+                    await lst.select_option("All")
+                    await asyncio.sleep(3)
+                    logger.info("Set lstAddress to All")
+        except Exception as e:
+            logger.warning(f"lstAddress failed: {e}")
+
+        # Step 5: Parse results
         html = await page.content()
         logger.info(f"Results HTML length: {len(html)}")
-
-        # Debug: show what's around grdIdisResult
-        idx = html.find("grdIdisResult")
-        logger.info(f"grdIdisResult position: {idx}")
-        if idx >= 0:
-            logger.info(f"Grid context: {html[max(0,idx-50):idx+200]}")
-
         all_records = parse_results_html(html)
         logger.info(f"Page 1: {len(all_records)} records")
 
-        # Step 5: Handle pagination
+        # Step 6: Handle pagination
         soup = BeautifulSoup(html, "html.parser")
         page_nav = soup.find("div", id="pnlNavigate")
         if page_nav:
@@ -190,7 +196,7 @@ class LADBSScraper:
                 "summary": "No records found.",
             }
 
-        # Step 6: Scrape detail pages
+        # Step 7: Scrape detail pages
         detailed = []
         all_attachments = []
 
@@ -199,7 +205,6 @@ class LADBSScraper:
             try:
                 await self._goto(page, rec["detail_url"])
                 detail_html = await page.content()
-
                 if "SessionExpired" in page.url or "IdisError" in page.url:
                     logger.warning(f"Session expired on detail {i+1}")
                     rec["detail_error"] = "Session expired"
