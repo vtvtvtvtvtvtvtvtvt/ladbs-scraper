@@ -171,3 +171,29 @@ async def fetch_image(url: str = Query(...)):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+@app.get("/map-tile")
+async def map_tile(url: str = Query(...)):
+    """Proxy ArcGIS map requests with ZIMAS referer header"""
+    import httpx
+    from fastapi.responses import Response
+    
+    # Only allow ZIMAS and LA City GIS domains
+    allowed = [
+        "zimas.lacity.org",
+        "gis.lacity.org", 
+        "cache.gis.lacounty.gov"
+    ]
+    if not any(domain in url for domain in allowed):
+        raise HTTPException(status_code=403, detail="Domain not allowed")
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers={
+            "Referer": "https://zimas.lacity.org/",
+            "Origin": "https://zimas.lacity.org",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        return Response(
+            content=resp.content,
+            media_type=resp.headers.get("content-type", "image/png"),
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
