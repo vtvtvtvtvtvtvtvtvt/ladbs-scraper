@@ -267,7 +267,7 @@ class LADBSScraper:
         except Exception as e:
             logger.warning(f"Form fill warning: {e}")
 
-        await page.click("input[name='btnSearchAssessor']")
+        await page.evaluate("document.querySelector(\"input[name='btnSearchAssessor']\").click()")
         await asyncio.sleep(3)
         logger.info(f"After assessor search submit: {page.url}")
 
