@@ -249,96 +249,52 @@ class LADBSScraper:
         parcel = ain_clean[7:10]
         logger.info(f"AIN split: book={book} page={pg} parcel={parcel}")
 
-        # Step 1: Establish session and load assessor search form
+        # Step 1: Navigate to assessor search page via Playwright
         await self._goto(page, MAIN_URL)
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT")
 
-        vs, vsg, ev = await self._get_viewstate(page)
-        hidden = await self._get_hidden_fields(page)
-        cookies = {c["name"]: c["value"] for c in await context.cookies()}
+        # Step 2: Fill and submit form via Playwright (same approach as address search)
+        try:
+            await page.fill("input[name='Assessor$txtBook']", book)
+            await page.fill("input[name='Assessor$txtPage']", pg)
+            await page.fill("input[name='Assessor$txtParcel']", parcel)
+        except Exception as e:
+            logger.warning(f"Form fill warning: {e}")
 
-        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT"
+        await page.click("input[name='btnNext1']")
+        await asyncio.sleep(3)
+        logger.info(f"After assessor search submit: {page.url}")
+
+        # Step 3: Get address selection page HTML and extract checkboxes
+        html1 = await page.content()
+        logger.info(f"Address selection HTML length: {len(html1)}")
+
+        # Get cookies and viewstate for httpx checkbox submissions
+        cookies = {c["name"]: c["value"] for c in await context.cookies()}
+        vs2, vsg2, ev2 = await self._get_viewstate(page)
+        hidden2 = await self._get_hidden_fields(page)
+
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": form_url,
+            "Referer": page.url,
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Origin": "https://ladbsdoc.lacity.org",
         }
+        checkbox_form_url = page.url
 
-        # Step 2: Submit assessor number search with 3 separate fields
-        post_data = {**hidden,
-            "__VIEWSTATE": vs,
-            "__VIEWSTATEGENERATOR": vsg,
-            "__EVENTVALIDATION": ev,
-            "__EVENTTARGET": "",
-            "__EVENTARGUMENT": "",
-            "Assessor$txtBook":   book,
-            "Assessor$txtPage":   pg,
-            "Assessor$txtParcel": parcel,
-            "btnNext1": "Next",
-        }
-
-        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
-            resp = await client.post(form_url, data=post_data, headers=headers)
-            logger.info(f"AIN Search POST: {resp.status_code} -> {resp.url}")
-            html1 = resp.text
-            for k, v in resp.cookies.items():
-                cookies[k] = v
-
-        await page.set_content(html1)
-        await asyncio.sleep(1)
-
-        # Step 3: Check if we landed directly on results page (assessor search skips checkbox step)
-        # If grdIdisResult is present, parse directly
+        # Check for direct results first
         direct_records = parse_results_html(html1)
         if direct_records:
-            logger.info(f"Direct results found: {len(direct_records)} records (no checkbox step)")
-            # Handle pagination
+            logger.info(f"Direct results: {len(direct_records)} records")
             all_records = []
             seen_ids = set()
             for r in direct_records:
                 if r["record_id"] not in seen_ids:
                     seen_ids.add(r["record_id"])
                     all_records.append(r)
-
-            soup_direct = BeautifulSoup(html1, "html.parser")
-            page_nav = soup_direct.find("div", id="pnlNavigate")
-            if page_nav:
-                results_url = f"{BASE_URL}/DocumentSearch.aspx?FromPage=Parcel&PanelVisible=SearchResult"
-                for pg_link in page_nav.find_all("a"):
-                    pg_text = pg_link.get_text(strip=True)
-                    if pg_text.isdigit() and int(pg_text) > 1:
-                        logger.info(f"Page {pg_text}...")
-                        try:
-                            vs2, vsg2, ev2 = await self._get_viewstate(page)
-                            hidden2 = await self._get_hidden_fields(page)
-                            pg_data = {**hidden2,
-                                "__VIEWSTATE": vs2,
-                                "__VIEWSTATEGENERATOR": vsg2,
-                                "__EVENTVALIDATION": ev2,
-                                "__EVENTTARGET": "",
-                                "__EVENTARGUMENT": "",
-                                "PageNavigate": "true",
-                                "PageNo": pg_text,
-                            }
-                            async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
-                                pg_resp = await client.post(results_url, data=pg_data, headers=headers)
-                                pg_html = pg_resp.text
-                                for k, v in pg_resp.cookies.items():
-                                    cookies[k] = v
-                            await page.set_content(pg_html)
-                            pg_records = parse_results_html(pg_html)
-                            for r in pg_records:
-                                if r["record_id"] not in seen_ids:
-                                    seen_ids.add(r["record_id"])
-                                    all_records.append(r)
-                        except Exception as e:
-                            logger.warning(f"Page {pg_text} failed: {e}")
-
-            logger.info(f"Total direct records: {len(all_records)}")
-            cb_pairs = []  # skip checkbox step
+            cb_pairs = []
         else:
-            # Check for checkboxes using BeautifulSoup on raw HTML
+            # Extract checkboxes from HTML using BeautifulSoup
             soup1 = BeautifulSoup(html1, "html.parser")
             cb_inputs = soup1.find_all("input", {"type": "checkbox"})
             cb_pairs = []
@@ -362,12 +318,7 @@ class LADBSScraper:
             all_records = []
             seen_ids = set()
 
-        vs2, vsg2, ev2 = await self._get_viewstate(page)
-        hidden2 = await self._get_hidden_fields(page)
-        # For checkbox step, use the address selection page URL
-        checkbox_form_url = str(resp.url) if cb_pairs else form_url
-
-        # Step 4: Submit each checkbox individually (only if no direct results)
+        # Step 4: Submit each checkbox individually
         if cb_pairs:
             for cb_name, cb_val in cb_pairs:
                 logger.info(f"Processing checkbox: {cb_name}")
