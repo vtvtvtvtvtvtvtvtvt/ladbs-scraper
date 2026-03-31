@@ -254,6 +254,12 @@ class LADBSScraper:
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT")
 
         # Step 2: Fill and submit form via Playwright (same approach as address search)
+        # Log all input fields on page to find correct names
+        inputs = await page.query_selector_all("input[type='text']")
+        for inp in inputs:
+            name = await inp.get_attribute("name")
+            logger.info(f"Input field found: name={name}")
+
         try:
             await page.fill("input[name='Assessor$txtBook']", book)
             await page.fill("input[name='Assessor$txtPage']", pg)
