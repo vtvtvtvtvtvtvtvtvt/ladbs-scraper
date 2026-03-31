@@ -262,32 +262,40 @@ class LADBSScraper:
         except Exception as e:
             logger.warning(f"Form fill warning: {e}")
 
-        # Submit via JavaScript to avoid click timeout issues
+        # Submit the assessor form - try multiple approaches
+        submitted = False
         try:
             await page.evaluate("""
                 document.querySelector("input[name='btnSearchAssessor']").click()
             """)
             logger.info("Clicked btnSearchAssessor via JS")
+            submitted = True
         except Exception as e:
-            logger.warning(f"JS click failed: {e}, trying form submit")
+            logger.warning(f"JS click failed: {e}")
+
+        if not submitted:
             try:
-                await page.evaluate("document.forms['ParcelSearch'].submit()")
+                # Try submitting the form that contains the assessor fields
+                await page.evaluate("""
+                    var btn = document.querySelector("input[name='btnSearchAssessor']");
+                    if (btn) { btn.click(); }
+                    else {
+                        // Find form containing assessor fields and submit
+                        var inp = document.querySelector("input[name='Assessor$txtAssessorNoBook']");
+                        if (inp) inp.closest('form').submit();
+                    }
+                """)
+                submitted = True
             except Exception as e2:
                 logger.warning(f"Form submit also failed: {e2}")
 
         await asyncio.sleep(4)
         html1 = await page.content()
         cookies = {c["name"]: c["value"] for c in await context.cookies()}
-        logger.info(f"After assessor submit: {page.url}")
+        logger.info(f"After assessor submit URL: {page.url}")
         logger.info(f"Address selection HTML length: {len(html1)}")
-
-        await page.set_content(html1)
-        await asyncio.sleep(1)
-        logger.info(f"Address selection HTML length: {len(html1)}")
-        logger.info(f"AIN search landed at: {resp.url}")
 
         # The checkbox form posts to DocumentSearch.aspx?SearchType=DCMT_ASSR
-        # This is the form action we observed in the browser
         checkbox_form_url = f"{BASE_URL}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
 
         # Get viewstate from the rendered page
