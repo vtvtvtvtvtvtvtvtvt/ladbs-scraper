@@ -240,15 +240,24 @@ class LADBSScraper:
 
     async def _run_ain(self, page, context, formatted_ain, raw_ain):
         """Search LADBS by AIN (Assessor Identification Number)"""
-        # Step 1: Establish session and load APN search form
+        # Parse AIN into Book/Page/Parcel - LADBS uses 3 separate fields
+        ain_clean = re.sub(r'[^0-9]', '', raw_ain)
+        if len(ain_clean) != 10:
+            raise ValueError(f"AIN must be 10 digits, got: {ain_clean}")
+        book   = ain_clean[0:4]
+        pg     = ain_clean[4:7]
+        parcel = ain_clean[7:10]
+        logger.info(f"AIN split: book={book} page={pg} parcel={parcel}")
+
+        # Step 1: Establish session and load assessor search form
         await self._goto(page, MAIN_URL)
-        await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_APN")
+        await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT")
 
         vs, vsg, ev = await self._get_viewstate(page)
         hidden = await self._get_hidden_fields(page)
         cookies = {c["name"]: c["value"] for c in await context.cookies()}
 
-        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_APN"
+        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT"
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer": form_url,
@@ -256,20 +265,22 @@ class LADBSScraper:
             "Origin": "https://ladbsdoc.lacity.org",
         }
 
-        # Step 2: Submit APN search
+        # Step 2: Submit assessor number search with 3 separate fields
         post_data = {**hidden,
             "__VIEWSTATE": vs,
             "__VIEWSTATEGENERATOR": vsg,
             "__EVENTVALIDATION": ev,
             "__EVENTTARGET": "",
             "__EVENTARGUMENT": "",
-            "Assessor$txtAIN": formatted_ain,
+            "Assessor$txtBook":   book,
+            "Assessor$txtPage":   pg,
+            "Assessor$txtParcel": parcel,
             "btnNext1": "Next",
         }
 
         async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
             resp = await client.post(form_url, data=post_data, headers=headers)
-            logger.info(f"APN Search POST: {resp.status_code} -> {resp.url}")
+            logger.info(f"AIN Search POST: {resp.status_code} -> {resp.url}")
             html1 = resp.text
             for k, v in resp.cookies.items():
                 cookies[k] = v
