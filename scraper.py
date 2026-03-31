@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
@@ -118,97 +119,167 @@ class LADBSScraper:
             logger.warning(f"goto warning: {e}")
         await asyncio.sleep(2)
 
+    async def _get_viewstate(self, page):
+        vs, vsg, ev = "", "", ""
+        try:
+            vs = await page.eval_on_selector("input[name='__VIEWSTATE']", "el => el.value") or ""
+        except: pass
+        try:
+            vsg = await page.eval_on_selector("input[name='__VIEWSTATEGENERATOR']", "el => el.value") or ""
+        except: pass
+        try:
+            ev = await page.eval_on_selector("input[name='__EVENTVALIDATION']", "el => el.value") or ""
+        except: pass
+        return vs, vsg, ev
+
+    async def _get_hidden_fields(self, page):
+        fields = {}
+        hiddens = await page.query_selector_all("input[type='hidden']")
+        for h in hiddens:
+            n = await h.get_attribute("name")
+            v = await h.get_attribute("value") or ""
+            if n:
+                fields[n] = v
+        return fields
+
+    async def _scrape_one_checkbox(self, page, context, cookies, headers, form_url, hidden, vs, vsg, ev, cb_name, cb_val):
+        """Submit the parcel search with a single checkbox and collect all records."""
+        post_data = {**hidden,
+            "__VIEWSTATE": vs,
+            "__VIEWSTATEGENERATOR": vsg,
+            "__EVENTVALIDATION": ev,
+            "__EVENTTARGET": "",
+            "__EVENTARGUMENT": "",
+            "btnSearch": "Continue",
+            cb_name: cb_val,
+        }
+
+        all_records = []
+        seen_ids = set()
+
+        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
+            resp = await client.post(form_url, data=post_data, headers=headers)
+            logger.info(f"Checkbox POST {cb_name}: {resp.status_code} -> {resp.url}")
+            html = resp.text
+            for k, v in resp.cookies.items():
+                cookies[k] = v
+
+        # Load into page for pagination
+        await page.set_content(html)
+        await asyncio.sleep(1)
+
+        records = parse_results_html(html)
+        for r in records:
+            if r["record_id"] not in seen_ids:
+                seen_ids.add(r["record_id"])
+                all_records.append(r)
+
+        # Handle pagination
+        soup = BeautifulSoup(html, "html.parser")
+        page_nav = soup.find("div", id="pnlNavigate")
+        if page_nav:
+            for pg_link in page_nav.find_all("a"):
+                pg_text = pg_link.get_text(strip=True)
+                if pg_text.isdigit() and int(pg_text) > 1:
+                    logger.info(f"  Page {pg_text}...")
+                    try:
+                        # Get viewstate from current page
+                        vs2, vsg2, ev2 = await self._get_viewstate(page)
+                        hidden2 = await self._get_hidden_fields(page)
+                        pg_data = {**hidden2,
+                            "__VIEWSTATE": vs2,
+                            "__VIEWSTATEGENERATOR": vsg2,
+                            "__EVENTVALIDATION": ev2,
+                            "__EVENTTARGET": "",
+                            "__EVENTARGUMENT": "",
+                            "PageNavigate": "true",
+                            "PageNo": pg_text,
+                        }
+                        results_url = str(resp.url)
+                        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
+                            pg_resp = await client.post(results_url, data=pg_data, headers=headers)
+                            pg_html = pg_resp.text
+                            for k, v in pg_resp.cookies.items():
+                                cookies[k] = v
+                        pg_records = parse_results_html(pg_html)
+                        for r in pg_records:
+                            if r["record_id"] not in seen_ids:
+                                seen_ids.add(r["record_id"])
+                                all_records.append(r)
+                    except Exception as e:
+                        logger.warning(f"Page {pg_text} failed: {e}")
+
+        logger.info(f"  Total for {cb_name}: {len(all_records)}")
+        return all_records, cookies
+
     async def _run(self, page, context, number, street_name, raw_address):
-        # Step 1: Load main page for session, then search form
+        # Step 1: Establish session and load search form
         await self._goto(page, MAIN_URL)
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
 
-        # Step 2: Fill and submit search form
-        await page.fill("input[name='Address$txtAddressBegNo']", number)
-        await page.fill("input[name='Address$txtAddressStreetName']", street_name)
-        await page.click("input[name='btnNext1']")
-        await asyncio.sleep(3)
-        logger.info(f"After search submit: {page.url}")
+        vs, vsg, ev = await self._get_viewstate(page)
+        hidden = await self._get_hidden_fields(page)
+        cookies = {c["name"]: c["value"] for c in await context.cookies()}
 
-        # Step 3: Address selection - check all and continue
-        checkboxes = await page.query_selector_all("input[type='checkbox']:not([id*='CheckAll'])")
-        logger.info(f"Address checkboxes: {len(checkboxes)}")
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Origin": "https://ladbsdoc.lacity.org",
+        }
 
-        if len(checkboxes) > 0:
-            for cb in checkboxes:
-                try:
-                    await cb.check()
-                except:
-                    pass
-            continue_btn = await page.query_selector("input[name='btnSearch'], input[value='Continue']")
-            if continue_btn:
-                await continue_btn.click()
-                await asyncio.sleep(5)
-            logger.info(f"After continue: {page.url}")
+        # Step 2: Submit search to get address selection page
+        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR"
+        post_data = {**hidden,
+            "__VIEWSTATE": vs,
+            "__VIEWSTATEGENERATOR": vsg,
+            "__EVENTVALIDATION": ev,
+            "__EVENTTARGET": "",
+            "__EVENTARGUMENT": "",
+            "Address$txtAddressBegNo": number,
+            "Address$txtAddressStreetName": street_name,
+            "btnNext1": "Next",
+        }
 
-        # Step 4: Get all address options from lstAddress dropdown
-        # The dropdown filters records by address - we iterate each option
+        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
+            resp = await client.post(form_url, data=post_data, headers=headers)
+            logger.info(f"Search POST: {resp.status_code} -> {resp.url}")
+            html1 = resp.text
+            for k, v in resp.cookies.items():
+                cookies[k] = v
+
+        # Load into page to extract checkboxes
+        await page.set_content(html1)
+        await asyncio.sleep(1)
+
+        # Step 3: Get all checkbox name/value pairs
+        checkboxes = await page.query_selector_all("input[type='checkbox']:not([id*='All'])")
+        cb_pairs = []
+        for cb in checkboxes:
+            cb_name = await cb.get_attribute("name") or ""
+            cb_val = await cb.get_attribute("value") or ""
+            if cb_name and cb_val:
+                cb_pairs.append((cb_name, cb_val))
+                logger.info(f"Checkbox: {cb_name} = {cb_val[:50]}")
+
+        # Get viewstate from address selection page
+        vs2, vsg2, ev2 = await self._get_viewstate(page)
+        hidden2 = await self._get_hidden_fields(page)
+
+        # Step 4: Submit EACH checkbox individually and collect records
         all_records = []
-        seen_record_ids = set()
+        seen_ids = set()
 
-        lst = await page.query_selector("select[name='lstAddress']")
-        if lst:
-            # Get all option values
-            options = await lst.evaluate(
-                "el => Array.from(el.options).map(o => ({value: o.value, text: o.text}))"
+        for cb_name, cb_val in cb_pairs:
+            logger.info(f"Processing checkbox: {cb_name}")
+            records, cookies = await self._scrape_one_checkbox(
+                page, context, cookies, headers, form_url,
+                hidden2, vs2, vsg2, ev2, cb_name, cb_val
             )
-            logger.info(f"lstAddress options: {[o['text'].strip() for o in options]}")
-
-            for opt in options:
-                opt_val = opt["value"]
-                opt_text = opt["text"].strip()
-                logger.info(f"Selecting address option: {opt_text}")
-
-                # Select this option - triggers __doPostBack
-                await lst.select_option(opt_val)
-                await asyncio.sleep(4)
-
-                # Parse records from this view
-                html = await page.content()
-                page_records = parse_results_html(html)
-                logger.info(f"  -> {len(page_records)} records for {opt_text}")
-
-                # Deduplicate by record_id
-                for rec in page_records:
-                    if rec["record_id"] not in seen_record_ids:
-                        seen_record_ids.add(rec["record_id"])
-                        all_records.append(rec)
-
-                # Handle pagination for this address option
-                soup = BeautifulSoup(html, "html.parser")
-                page_nav = soup.find("div", id="pnlNavigate")
-                if page_nav:
-                    pg_links = page_nav.find_all("a")
-                    for pg_link in pg_links:
-                        pg_text = pg_link.get_text(strip=True)
-                        if pg_text.isdigit() and int(pg_text) > 1:
-                            logger.info(f"  Page {pg_text} for {opt_text}")
-                            try:
-                                await page.evaluate(f"goPage('{pg_text}')")
-                                await asyncio.sleep(4)
-                                pg_html = await page.content()
-                                pg_records = parse_results_html(pg_html)
-                                for rec in pg_records:
-                                    if rec["record_id"] not in seen_record_ids:
-                                        seen_record_ids.add(rec["record_id"])
-                                        all_records.append(rec)
-                                # Go back to page 1 before next address option
-                                await page.evaluate("goPage('1')")
-                                await asyncio.sleep(3)
-                                # Re-select the dropdown since page reload resets it
-                                lst = await page.query_selector("select[name='lstAddress']")
-                            except Exception as e:
-                                logger.warning(f"Pagination failed: {e}")
-        else:
-            # No dropdown - just parse whatever is on page
-            logger.info("No lstAddress dropdown found, parsing current page")
-            html = await page.content()
-            all_records = parse_results_html(html)
+            for r in records:
+                if r["record_id"] not in seen_ids:
+                    seen_ids.add(r["record_id"])
+                    all_records.append(r)
 
         logger.info(f"Total unique records: {len(all_records)}")
 
@@ -221,7 +292,7 @@ class LADBSScraper:
                 "summary": "No records found.",
             }
 
-        # Step 5: Scrape detail pages
+        # Step 5: Scrape each detail page using the browser session
         detailed = []
         all_attachments = []
 
@@ -231,8 +302,14 @@ class LADBSScraper:
                 await self._goto(page, rec["detail_url"])
                 detail_html = await page.content()
                 if "SessionExpired" in page.url or "IdisError" in page.url:
-                    logger.warning(f"Session expired on detail {i+1}")
-                    rec["detail_error"] = "Session expired"
+                    # Try with fresh httpx request using cookies
+                    async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=20) as client:
+                        dr = await client.get(rec["detail_url"])
+                        if "SessionExpired" not in str(dr.url):
+                            detail = self._parse_detail_html(dr.text)
+                            rec.update(detail)
+                        else:
+                            rec["detail_error"] = "Session expired"
                 else:
                     detail = self._parse_detail_html(detail_html)
                     rec.update(detail)
