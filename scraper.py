@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import re
-import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
@@ -27,7 +26,7 @@ def parse_results_html(html: str) -> list:
 
     grid = soup.find("table", id="grdIdisResult")
     if not grid:
-        logger.warning("grdIdisResult table not found in HTML")
+        logger.warning("grdIdisResult table not found")
         return records
 
     rows = grid.find_all("tr")
@@ -86,7 +85,7 @@ def parse_results_html(html: str) -> list:
             })
 
         records.append(record)
-        logger.info(f"Row {i+1}: {doc_type} | {sub_type} | {doc_date} | {doc_number} | img={image_visible}")
+        logger.info(f"  {doc_type} | {sub_type} | {doc_date} | {doc_number} | img={image_visible}")
 
     return records
 
@@ -124,7 +123,7 @@ class LADBSScraper:
         await self._goto(page, MAIN_URL)
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
 
-        # Step 2: Fill and submit search form via Playwright
+        # Step 2: Fill and submit search form
         await page.fill("input[name='Address$txtAddressBegNo']", number)
         await page.fill("input[name='Address$txtAddressStreetName']", street_name)
         await page.click("input[name='btnNext1']")
@@ -144,48 +143,74 @@ class LADBSScraper:
             continue_btn = await page.query_selector("input[name='btnSearch'], input[value='Continue']")
             if continue_btn:
                 await continue_btn.click()
-                await asyncio.sleep(4)
+                await asyncio.sleep(5)
             logger.info(f"After continue: {page.url}")
 
-        # Step 4: Ensure lstAddress is set to "All" to see all records
-        try:
-            lst = await page.query_selector("select[name='lstAddress']")
-            if lst:
-                current_val = await lst.evaluate("el => el.value")
-                logger.info(f"lstAddress value: {current_val}")
-                if current_val != "All":
-                    await lst.select_option("All")
-                    await asyncio.sleep(3)
-                    logger.info("Set lstAddress to All")
-        except Exception as e:
-            logger.warning(f"lstAddress failed: {e}")
+        # Step 4: Get all address options from lstAddress dropdown
+        # The dropdown filters records by address - we iterate each option
+        all_records = []
+        seen_record_ids = set()
 
-        # Step 5: Parse results
-        html = await page.content()
-        logger.info(f"Results HTML length: {len(html)}")
-        all_records = parse_results_html(html)
-        logger.info(f"Page 1: {len(all_records)} records")
+        lst = await page.query_selector("select[name='lstAddress']")
+        if lst:
+            # Get all option values
+            options = await lst.evaluate(
+                "el => Array.from(el.options).map(o => ({value: o.value, text: o.text}))"
+            )
+            logger.info(f"lstAddress options: {[o['text'].strip() for o in options]}")
 
-        # Step 6: Handle pagination
-        soup = BeautifulSoup(html, "html.parser")
-        page_nav = soup.find("div", id="pnlNavigate")
-        if page_nav:
-            page_links = page_nav.find_all("a")
-            for pg_link in page_links:
-                pg_text = pg_link.get_text(strip=True)
-                if pg_text.isdigit() and int(pg_text) > 1:
-                    logger.info(f"Navigating to page {pg_text}...")
-                    try:
-                        await page.evaluate(f"goPage('{pg_text}')")
-                        await asyncio.sleep(4)
-                        pg_html = await page.content()
-                        pg_records = parse_results_html(pg_html)
-                        logger.info(f"Page {pg_text}: {len(pg_records)} records")
-                        all_records.extend(pg_records)
-                    except Exception as e:
-                        logger.warning(f"Page {pg_text} failed: {e}")
+            for opt in options:
+                opt_val = opt["value"]
+                opt_text = opt["text"].strip()
+                logger.info(f"Selecting address option: {opt_text}")
 
-        logger.info(f"Total records: {len(all_records)}")
+                # Select this option - triggers __doPostBack
+                await lst.select_option(opt_val)
+                await asyncio.sleep(4)
+
+                # Parse records from this view
+                html = await page.content()
+                page_records = parse_results_html(html)
+                logger.info(f"  -> {len(page_records)} records for {opt_text}")
+
+                # Deduplicate by record_id
+                for rec in page_records:
+                    if rec["record_id"] not in seen_record_ids:
+                        seen_record_ids.add(rec["record_id"])
+                        all_records.append(rec)
+
+                # Handle pagination for this address option
+                soup = BeautifulSoup(html, "html.parser")
+                page_nav = soup.find("div", id="pnlNavigate")
+                if page_nav:
+                    pg_links = page_nav.find_all("a")
+                    for pg_link in pg_links:
+                        pg_text = pg_link.get_text(strip=True)
+                        if pg_text.isdigit() and int(pg_text) > 1:
+                            logger.info(f"  Page {pg_text} for {opt_text}")
+                            try:
+                                await page.evaluate(f"goPage('{pg_text}')")
+                                await asyncio.sleep(4)
+                                pg_html = await page.content()
+                                pg_records = parse_results_html(pg_html)
+                                for rec in pg_records:
+                                    if rec["record_id"] not in seen_record_ids:
+                                        seen_record_ids.add(rec["record_id"])
+                                        all_records.append(rec)
+                                # Go back to page 1 before next address option
+                                await page.evaluate("goPage('1')")
+                                await asyncio.sleep(3)
+                                # Re-select the dropdown since page reload resets it
+                                lst = await page.query_selector("select[name='lstAddress']")
+                            except Exception as e:
+                                logger.warning(f"Pagination failed: {e}")
+        else:
+            # No dropdown - just parse whatever is on page
+            logger.info("No lstAddress dropdown found, parsing current page")
+            html = await page.content()
+            all_records = parse_results_html(html)
+
+        logger.info(f"Total unique records: {len(all_records)}")
 
         if not all_records:
             return {
@@ -196,7 +221,7 @@ class LADBSScraper:
                 "summary": "No records found.",
             }
 
-        # Step 7: Scrape detail pages
+        # Step 5: Scrape detail pages
         detailed = []
         all_attachments = []
 
