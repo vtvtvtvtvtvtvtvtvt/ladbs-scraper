@@ -261,9 +261,9 @@ class LADBSScraper:
             logger.info(f"Input field found: name={name}")
 
         try:
-            await page.fill("input[name='Assessor$txtBook']", book)
-            await page.fill("input[name='Assessor$txtPage']", pg)
-            await page.fill("input[name='Assessor$txtParcel']", parcel)
+            await page.fill("input[name='Assessor$txtAssessorNoBook']", book)
+            await page.fill("input[name='Assessor$txtAssessorNoPage']", pg)
+            await page.fill("input[name='Assessor$txtAssessorNoParcel']", parcel)
         except Exception as e:
             logger.warning(f"Form fill warning: {e}")
 
