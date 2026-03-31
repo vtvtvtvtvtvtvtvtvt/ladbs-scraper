@@ -288,43 +288,97 @@ class LADBSScraper:
         await page.set_content(html1)
         await asyncio.sleep(1)
 
-        # Step 3: Get all checkboxes
-        checkboxes = await page.query_selector_all("input[type='checkbox']:not([id*='All'])")
-        cb_pairs = []
-        for cb in checkboxes:
-            cb_name = await cb.get_attribute("name") or ""
-            cb_val = await cb.get_attribute("value") or ""
-            if cb_name and cb_val:
-                cb_pairs.append((cb_name, cb_val))
-                logger.info(f"Checkbox: {cb_name} = {cb_val[:60]}")
-
-        if not cb_pairs:
-            logger.warning(f"No checkboxes found for AIN {formatted_ain}")
-            return {
-                "ain": raw_ain,
-                "total_records": 0,
-                "records": [],
-                "attachments": [],
-                "summary": f"No records found for AIN {raw_ain}.",
-            }
-
-        vs2, vsg2, ev2 = await self._get_viewstate(page)
-        hidden2 = await self._get_hidden_fields(page)
-
-        # Step 4: Submit each checkbox individually
-        all_records = []
-        seen_ids = set()
-
-        for cb_name, cb_val in cb_pairs:
-            logger.info(f"Processing checkbox: {cb_name}")
-            records, cookies = await self._scrape_one_checkbox(
-                page, context, cookies, headers, form_url,
-                hidden2, vs2, vsg2, ev2, cb_name, cb_val
-            )
-            for r in records:
+        # Step 3: Check if we landed directly on results page (assessor search skips checkbox step)
+        # If grdIdisResult is present, parse directly
+        direct_records = parse_results_html(html1)
+        if direct_records:
+            logger.info(f"Direct results found: {len(direct_records)} records (no checkbox step)")
+            # Handle pagination
+            all_records = []
+            seen_ids = set()
+            for r in direct_records:
                 if r["record_id"] not in seen_ids:
                     seen_ids.add(r["record_id"])
                     all_records.append(r)
+
+            soup_direct = BeautifulSoup(html1, "html.parser")
+            page_nav = soup_direct.find("div", id="pnlNavigate")
+            if page_nav:
+                results_url = f"{BASE_URL}/DocumentSearch.aspx?FromPage=Parcel&PanelVisible=SearchResult"
+                for pg_link in page_nav.find_all("a"):
+                    pg_text = pg_link.get_text(strip=True)
+                    if pg_text.isdigit() and int(pg_text) > 1:
+                        logger.info(f"Page {pg_text}...")
+                        try:
+                            vs2, vsg2, ev2 = await self._get_viewstate(page)
+                            hidden2 = await self._get_hidden_fields(page)
+                            pg_data = {**hidden2,
+                                "__VIEWSTATE": vs2,
+                                "__VIEWSTATEGENERATOR": vsg2,
+                                "__EVENTVALIDATION": ev2,
+                                "__EVENTTARGET": "",
+                                "__EVENTARGUMENT": "",
+                                "PageNavigate": "true",
+                                "PageNo": pg_text,
+                            }
+                            async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
+                                pg_resp = await client.post(results_url, data=pg_data, headers=headers)
+                                pg_html = pg_resp.text
+                                for k, v in pg_resp.cookies.items():
+                                    cookies[k] = v
+                            await page.set_content(pg_html)
+                            pg_records = parse_results_html(pg_html)
+                            for r in pg_records:
+                                if r["record_id"] not in seen_ids:
+                                    seen_ids.add(r["record_id"])
+                                    all_records.append(r)
+                        except Exception as e:
+                            logger.warning(f"Page {pg_text} failed: {e}")
+
+            logger.info(f"Total direct records: {len(all_records)}")
+            cb_pairs = []  # skip checkbox step
+        else:
+            # Check for checkboxes using BeautifulSoup on raw HTML
+            soup1 = BeautifulSoup(html1, "html.parser")
+            cb_inputs = soup1.find_all("input", {"type": "checkbox"})
+            cb_pairs = []
+            for cb in cb_inputs:
+                cb_name = cb.get("name", "")
+                cb_val = cb.get("value", "")
+                cb_id = cb.get("id", "")
+                if cb_name and cb_val and "All" not in cb_id and "All" not in cb_name:
+                    cb_pairs.append((cb_name, cb_val))
+                    logger.info(f"Checkbox: {cb_name} = {cb_val[:60]}")
+
+            if not cb_pairs:
+                logger.warning(f"No checkboxes and no direct results for AIN {formatted_ain}")
+                return {
+                    "ain": raw_ain,
+                    "total_records": 0,
+                    "records": [],
+                    "attachments": [],
+                    "summary": f"No records found for AIN {raw_ain}.",
+                }
+            all_records = []
+            seen_ids = set()
+
+        vs2, vsg2, ev2 = await self._get_viewstate(page)
+        hidden2 = await self._get_hidden_fields(page)
+        # For checkbox step, use the address selection page URL
+        checkbox_form_url = str(resp.url) if cb_pairs else form_url
+
+        # Step 4: Submit each checkbox individually (only if no direct results)
+        if cb_pairs:
+            for cb_name, cb_val in cb_pairs:
+                logger.info(f"Processing checkbox: {cb_name}")
+                records, cookies = await self._scrape_one_checkbox(
+                    page, context, cookies, headers, checkbox_form_url,
+                    hidden2, vs2, vsg2, ev2, cb_name, cb_val
+                )
+                for r in records:
+                    if r["record_id"] not in seen_ids:
+                        seen_ids.add(r["record_id"])
+                        all_records.append(r)
 
         logger.info(f"Total unique records: {len(all_records)}")
 
