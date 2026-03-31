@@ -284,14 +284,18 @@ class LADBSScraper:
             html1 = resp.text
             for k, v in resp.cookies.items():
                 cookies[k] = v
+            # Debug: show snippet to see what page we got
+            snippet = html1[2000:2500].replace('\n', ' ').replace('\r', '')
+            logger.info(f"Response snippet: {snippet}")
 
         await page.set_content(html1)
         await asyncio.sleep(1)
         logger.info(f"Address selection HTML length: {len(html1)}")
         logger.info(f"AIN search landed at: {resp.url}")
 
-        # The checkbox form posts to the actual response URL
-        checkbox_form_url = str(resp.url)
+        # The checkbox form posts to DocumentSearch.aspx?SearchType=DCMT_ASSR
+        # This is the form action we observed in the browser
+        checkbox_form_url = f"{BASE_URL}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
 
         # Get viewstate from the response HTML directly
         soup_vs = BeautifulSoup(html1, "html.parser")
@@ -336,9 +340,11 @@ class LADBSScraper:
                 cb_name = cb.get("name", "")
                 cb_val = cb.get("value", "")
                 cb_id = cb.get("id", "")
-                if cb_name and cb_val and "All" not in cb_id and "All" not in cb_name:
+                logger.info(f"Found checkbox: name={cb_name} id={cb_id} val={cb_val[:40]}")
+                # Include chkAddress fields, exclude CheckAll
+                if cb_name and cb_val and cb_name != "CheckAll" and cb_id != "CheckAll":
                     cb_pairs.append((cb_name, cb_val))
-                    logger.info(f"Checkbox: {cb_name} = {cb_val[:60]}")
+                    logger.info(f"Added checkbox: {cb_name} = {cb_val[:60]}")
 
             if not cb_pairs:
                 logger.warning(f"No checkboxes and no direct results for AIN {formatted_ain}")
