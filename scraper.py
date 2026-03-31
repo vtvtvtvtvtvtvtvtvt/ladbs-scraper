@@ -21,6 +21,13 @@ def parse_address(raw: str):
     name = tokens[1] if len(tokens) > 1 else ""
     return number, name
 
+def format_ain(ain: str) -> str:
+    """Format AIN for LADBS search. LADBS expects format: XXXX-XXX-XXX"""
+    ain = re.sub(r'[^0-9]', '', ain)  # strip all non-digits
+    if len(ain) == 10:
+        return f"{ain[0:4]}-{ain[4:7]}-{ain[7:10]}"
+    return ain  # return as-is if not 10 digits
+
 def parse_results_html(html: str) -> list:
     soup = BeautifulSoup(html, "html.parser")
     records = []
@@ -93,6 +100,7 @@ def parse_results_html(html: str) -> list:
 class LADBSScraper:
 
     async def scrape(self, address: str) -> dict:
+        """Search by address (legacy)"""
         number, street_name = parse_address(address)
         logger.info(f"Parsed: number={number}, street={street_name}")
 
@@ -107,7 +115,27 @@ class LADBSScraper:
             page = await context.new_page()
             page.set_default_timeout(30000)
             try:
-                return await self._run(page, context, number, street_name, address)
+                return await self._run_address(page, context, number, street_name, address)
+            finally:
+                await browser.close()
+
+    async def scrape_by_ain(self, ain: str) -> dict:
+        """Search by Assessor Identification Number (APN)"""
+        formatted_ain = format_ain(ain)
+        logger.info(f"Scraping by AIN: {ain} -> formatted: {formatted_ain}")
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            page.set_default_timeout(30000)
+            try:
+                return await self._run_ain(page, context, formatted_ain, ain)
             finally:
                 await browser.close()
 
@@ -164,7 +192,6 @@ class LADBSScraper:
             for k, v in resp.cookies.items():
                 cookies[k] = v
 
-        # Load into page for pagination
         await page.set_content(html)
         await asyncio.sleep(1)
 
@@ -183,7 +210,6 @@ class LADBSScraper:
                 if pg_text.isdigit() and int(pg_text) > 1:
                     logger.info(f"  Page {pg_text}...")
                     try:
-                        # Get viewstate from current page
                         vs2, vsg2, ev2 = await self._get_viewstate(page)
                         hidden2 = await self._get_hidden_fields(page)
                         pg_data = {**hidden2,
@@ -212,8 +238,126 @@ class LADBSScraper:
         logger.info(f"  Total for {cb_name}: {len(all_records)}")
         return all_records, cookies
 
-    async def _run(self, page, context, number, street_name, raw_address):
-        # Step 1: Establish session and load search form
+    async def _run_ain(self, page, context, formatted_ain, raw_ain):
+        """Search LADBS by AIN (Assessor Identification Number)"""
+        # Step 1: Establish session and load APN search form
+        await self._goto(page, MAIN_URL)
+        await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_APN")
+
+        vs, vsg, ev = await self._get_viewstate(page)
+        hidden = await self._get_hidden_fields(page)
+        cookies = {c["name"]: c["value"] for c in await context.cookies()}
+
+        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_APN"
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": form_url,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Origin": "https://ladbsdoc.lacity.org",
+        }
+
+        # Step 2: Submit APN search
+        post_data = {**hidden,
+            "__VIEWSTATE": vs,
+            "__VIEWSTATEGENERATOR": vsg,
+            "__EVENTVALIDATION": ev,
+            "__EVENTTARGET": "",
+            "__EVENTARGUMENT": "",
+            "Assessor$txtAIN": formatted_ain,
+            "btnNext1": "Next",
+        }
+
+        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
+            resp = await client.post(form_url, data=post_data, headers=headers)
+            logger.info(f"APN Search POST: {resp.status_code} -> {resp.url}")
+            html1 = resp.text
+            for k, v in resp.cookies.items():
+                cookies[k] = v
+
+        await page.set_content(html1)
+        await asyncio.sleep(1)
+
+        # Step 3: Get all checkboxes
+        checkboxes = await page.query_selector_all("input[type='checkbox']:not([id*='All'])")
+        cb_pairs = []
+        for cb in checkboxes:
+            cb_name = await cb.get_attribute("name") or ""
+            cb_val = await cb.get_attribute("value") or ""
+            if cb_name and cb_val:
+                cb_pairs.append((cb_name, cb_val))
+                logger.info(f"Checkbox: {cb_name} = {cb_val[:60]}")
+
+        if not cb_pairs:
+            logger.warning(f"No checkboxes found for AIN {formatted_ain}")
+            return {
+                "ain": raw_ain,
+                "total_records": 0,
+                "records": [],
+                "attachments": [],
+                "summary": f"No records found for AIN {raw_ain}.",
+            }
+
+        vs2, vsg2, ev2 = await self._get_viewstate(page)
+        hidden2 = await self._get_hidden_fields(page)
+
+        # Step 4: Submit each checkbox individually
+        all_records = []
+        seen_ids = set()
+
+        for cb_name, cb_val in cb_pairs:
+            logger.info(f"Processing checkbox: {cb_name}")
+            records, cookies = await self._scrape_one_checkbox(
+                page, context, cookies, headers, form_url,
+                hidden2, vs2, vsg2, ev2, cb_name, cb_val
+            )
+            for r in records:
+                if r["record_id"] not in seen_ids:
+                    seen_ids.add(r["record_id"])
+                    all_records.append(r)
+
+        logger.info(f"Total unique records: {len(all_records)}")
+
+        if not all_records:
+            return {
+                "ain": raw_ain,
+                "total_records": 0,
+                "records": [],
+                "attachments": [],
+                "summary": f"No records found for AIN {raw_ain}.",
+            }
+
+        # Step 5: Scrape detail pages
+        detailed = []
+        all_attachments = []
+
+        for i, rec in enumerate(all_records):
+            logger.info(f"Detail {i+1}/{len(all_records)}: {rec['doc_type']} {rec['doc_number']}")
+            try:
+                await self._goto(page, rec["detail_url"])
+                detail_html = await page.content()
+                if "SessionExpired" in page.url or "IdisError" in page.url:
+                    logger.warning(f"Session expired on detail {i+1}")
+                    rec["detail_error"] = "Session expired"
+                else:
+                    detail = self._parse_detail_html(detail_html)
+                    rec.update(detail)
+            except Exception as e:
+                logger.warning(f"Detail {i+1} failed: {e}")
+                rec["detail_error"] = str(e)
+
+            detailed.append(rec)
+            all_attachments.extend(rec.get("attachments", []))
+
+        return {
+            "ain": raw_ain,
+            "total_records": len(detailed),
+            "records": detailed,
+            "attachments": all_attachments,
+            "summary": self._build_summary(detailed, f"AIN {raw_ain}"),
+        }
+
+    async def _run_address(self, page, context, number, street_name, raw_address):
+        """Search LADBS by address (legacy method)"""
         await self._goto(page, MAIN_URL)
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
 
@@ -228,7 +372,6 @@ class LADBSScraper:
             "Origin": "https://ladbsdoc.lacity.org",
         }
 
-        # Step 2: Submit search to get address selection page
         form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR"
         post_data = {**hidden,
             "__VIEWSTATE": vs,
@@ -248,11 +391,9 @@ class LADBSScraper:
             for k, v in resp.cookies.items():
                 cookies[k] = v
 
-        # Load into page to extract checkboxes
         await page.set_content(html1)
         await asyncio.sleep(1)
 
-        # Step 3: Get all checkbox name/value pairs
         checkboxes = await page.query_selector_all("input[type='checkbox']:not([id*='All'])")
         cb_pairs = []
         for cb in checkboxes:
@@ -262,11 +403,9 @@ class LADBSScraper:
                 cb_pairs.append((cb_name, cb_val))
                 logger.info(f"Checkbox: {cb_name} = {cb_val[:50]}")
 
-        # Get viewstate from address selection page
         vs2, vsg2, ev2 = await self._get_viewstate(page)
         hidden2 = await self._get_hidden_fields(page)
 
-        # Step 4: Submit EACH checkbox individually and collect records
         all_records = []
         seen_ids = set()
 
@@ -292,7 +431,6 @@ class LADBSScraper:
                 "summary": "No records found.",
             }
 
-        # Step 5: Scrape each detail page using the browser session
         detailed = []
         all_attachments = []
 
@@ -302,14 +440,8 @@ class LADBSScraper:
                 await self._goto(page, rec["detail_url"])
                 detail_html = await page.content()
                 if "SessionExpired" in page.url or "IdisError" in page.url:
-                    # Try with fresh httpx request using cookies
-                    async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=20) as client:
-                        dr = await client.get(rec["detail_url"])
-                        if "SessionExpired" not in str(dr.url):
-                            detail = self._parse_detail_html(dr.text)
-                            rec.update(detail)
-                        else:
-                            rec["detail_error"] = "Session expired"
+                    logger.warning(f"Session expired on detail {i+1}")
+                    rec["detail_error"] = "Session expired"
                 else:
                     detail = self._parse_detail_html(detail_html)
                     rec.update(detail)
@@ -341,16 +473,16 @@ class LADBSScraper:
                     detail[key] = value
         return detail
 
-    def _build_summary(self, records, address):
+    def _build_summary(self, records, identifier):
         if not records:
-            return f"No records found for {address}."
+            return f"No records found for {identifier}."
         type_counts = {}
         total_attachments = 0
         for r in records:
             t = r.get("doc_type", "Unknown")
             type_counts[t] = type_counts.get(t, 0) + 1
             total_attachments += len(r.get("attachments", []))
-        lines = [f"Found {len(records)} record(s) for {address}:"]
+        lines = [f"Found {len(records)} record(s) for {identifier}:"]
         for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
             lines.append(f"  • {t}: {c}")
         lines.append(f"Total attachments available: {total_attachments}")
