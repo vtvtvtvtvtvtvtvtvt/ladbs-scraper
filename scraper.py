@@ -170,7 +170,7 @@ class LADBSScraper:
                 fields[n] = v
         return fields
 
-    async def _scrape_one_checkbox(self, page, context, cookies, headers, form_url, hidden, vs, vsg, ev, cb_name, cb_val):
+    async def _scrape_one_checkbox(self, page, context, cookies, headers, form_url, hidden, vs, vsg, ev, cb_name, cb_val, btn_name="btnSearch", btn_val="Continue"):
         """Submit the parcel search with a single checkbox and collect all records."""
         post_data = {**hidden,
             "__VIEWSTATE": vs,
@@ -178,7 +178,7 @@ class LADBSScraper:
             "__EVENTVALIDATION": ev,
             "__EVENTTARGET": "",
             "__EVENTARGUMENT": "",
-            "btnSearch": "Continue",
+            btn_name: btn_val,
             cb_name: cb_val,
         }
 
@@ -253,40 +253,68 @@ class LADBSScraper:
         await self._goto(page, MAIN_URL)
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT")
 
-        # Step 2: Fill and submit form via Playwright (same approach as address search)
-        # Log all input fields on page to find correct names
-        inputs = await page.query_selector_all("input[type='text']")
-        for inp in inputs:
-            name = await inp.get_attribute("name")
-            logger.info(f"Input field found: name={name}")
-
-        try:
-            await page.fill("input[name='Assessor$txtAssessorNoBook']", book)
-            await page.fill("input[name='Assessor$txtAssessorNoPage']", pg)
-            await page.fill("input[name='Assessor$txtAssessorNoParcel']", parcel)
-        except Exception as e:
-            logger.warning(f"Form fill warning: {e}")
-
-        await page.evaluate("document.querySelector(\"input[name='btnSearchAssessor']\").click()")
-        await asyncio.sleep(3)
-        logger.info(f"After assessor search submit: {page.url}")
-
-        # Step 3: Get address selection page HTML and extract checkboxes
-        html1 = await page.content()
-        logger.info(f"Address selection HTML length: {len(html1)}")
-
-        # Get cookies and viewstate for httpx checkbox submissions
+        # Step 2: Fill fields and submit via httpx POST using session cookies
+        vs, vsg, ev = await self._get_viewstate(page)
+        hidden = await self._get_hidden_fields(page)
         cookies = {c["name"]: c["value"] for c in await context.cookies()}
-        vs2, vsg2, ev2 = await self._get_viewstate(page)
-        hidden2 = await self._get_hidden_fields(page)
 
+        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT"
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": page.url,
+            "Referer": form_url,
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Origin": "https://ladbsdoc.lacity.org",
         }
-        checkbox_form_url = page.url
+
+        post_data = {**hidden,
+            "__VIEWSTATE": vs,
+            "__VIEWSTATEGENERATOR": vsg,
+            "__EVENTVALIDATION": ev,
+            "__EVENTTARGET": "",
+            "__EVENTARGUMENT": "",
+            "Assessor$txtAssessorNoBook": book,
+            "Assessor$txtAssessorNoPage": pg,
+            "Assessor$txtAssessorNoParcel": parcel,
+            "btnSearchAssessor": "Search",
+        }
+
+        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
+            resp = await client.post(form_url, data=post_data, headers=headers)
+            logger.info(f"AIN Search POST: {resp.status_code} -> {resp.url}")
+            html1 = resp.text
+            for k, v in resp.cookies.items():
+                cookies[k] = v
+
+        await page.set_content(html1)
+        await asyncio.sleep(1)
+        logger.info(f"Address selection HTML length: {len(html1)}")
+        logger.info(f"AIN search landed at: {resp.url}")
+
+        # The checkbox form posts to the actual response URL
+        checkbox_form_url = str(resp.url)
+
+        # Get viewstate from the response HTML directly
+        soup_vs = BeautifulSoup(html1, "html.parser")
+        def get_val(name):
+            el = soup_vs.find("input", {"name": name})
+            return el.get("value", "") if el else ""
+
+        vs2 = get_val("__VIEWSTATE")
+        vsg2 = get_val("__VIEWSTATEGENERATOR")
+        ev2 = get_val("__EVENTVALIDATION")
+        hidden2 = {}
+        for inp in soup_vs.find_all("input", {"type": "hidden"}):
+            n = inp.get("name", "")
+            v = inp.get("value", "")
+            if n:
+                hidden2[n] = v
+
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": checkbox_form_url,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Origin": "https://ladbsdoc.lacity.org",
+        }
 
         # Check for direct results first
         direct_records = parse_results_html(html1)
@@ -330,7 +358,8 @@ class LADBSScraper:
                 logger.info(f"Processing checkbox: {cb_name}")
                 records, cookies = await self._scrape_one_checkbox(
                     page, context, cookies, headers, checkbox_form_url,
-                    hidden2, vs2, vsg2, ev2, cb_name, cb_val
+                    hidden2, vs2, vsg2, ev2, cb_name, cb_val,
+                    btn_name="btnNext2", btn_val="Continue"
                 )
                 for r in records:
                     if r["record_id"] not in seen_ids:
