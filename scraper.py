@@ -253,40 +253,33 @@ class LADBSScraper:
         await self._goto(page, MAIN_URL)
         await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT")
 
-        # Step 2: Fill fields and submit via httpx POST using session cookies
-        vs, vsg, ev = await self._get_viewstate(page)
-        hidden = await self._get_hidden_fields(page)
+        # Step 2: Fill and submit assessor form via Playwright
+        try:
+            await page.fill("input[name='Assessor$txtAssessorNoBook']", book)
+            await page.fill("input[name='Assessor$txtAssessorNoPage']", pg)
+            await page.fill("input[name='Assessor$txtAssessorNoParcel']", parcel)
+            logger.info(f"Filled assessor fields: {book} / {pg} / {parcel}")
+        except Exception as e:
+            logger.warning(f"Form fill warning: {e}")
+
+        # Submit via JavaScript to avoid click timeout issues
+        try:
+            await page.evaluate("""
+                document.querySelector("input[name='btnSearchAssessor']").click()
+            """)
+            logger.info("Clicked btnSearchAssessor via JS")
+        except Exception as e:
+            logger.warning(f"JS click failed: {e}, trying form submit")
+            try:
+                await page.evaluate("document.forms['ParcelSearch'].submit()")
+            except Exception as e2:
+                logger.warning(f"Form submit also failed: {e2}")
+
+        await asyncio.sleep(4)
+        html1 = await page.content()
         cookies = {c["name"]: c["value"] for c in await context.cookies()}
-
-        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT"
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": form_url,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Origin": "https://ladbsdoc.lacity.org",
-        }
-
-        post_data = {**hidden,
-            "__VIEWSTATE": vs,
-            "__VIEWSTATEGENERATOR": vsg,
-            "__EVENTVALIDATION": ev,
-            "__EVENTTARGET": "",
-            "__EVENTARGUMENT": "",
-            "Assessor$txtAssessorNoBook": book,
-            "Assessor$txtAssessorNoPage": pg,
-            "Assessor$txtAssessorNoParcel": parcel,
-            "btnSearchAssessor": "Search",
-        }
-
-        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
-            resp = await client.post(form_url, data=post_data, headers=headers)
-            logger.info(f"AIN Search POST: {resp.status_code} -> {resp.url}")
-            html1 = resp.text
-            for k, v in resp.cookies.items():
-                cookies[k] = v
-            # Debug: show snippet to see what page we got
-            snippet = html1[2000:2500].replace('\n', ' ').replace('\r', '')
-            logger.info(f"Response snippet: {snippet}")
+        logger.info(f"After assessor submit: {page.url}")
+        logger.info(f"Address selection HTML length: {len(html1)}")
 
         await page.set_content(html1)
         await asyncio.sleep(1)
@@ -297,21 +290,9 @@ class LADBSScraper:
         # This is the form action we observed in the browser
         checkbox_form_url = f"{BASE_URL}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
 
-        # Get viewstate from the response HTML directly
-        soup_vs = BeautifulSoup(html1, "html.parser")
-        def get_val(name):
-            el = soup_vs.find("input", {"name": name})
-            return el.get("value", "") if el else ""
-
-        vs2 = get_val("__VIEWSTATE")
-        vsg2 = get_val("__VIEWSTATEGENERATOR")
-        ev2 = get_val("__EVENTVALIDATION")
-        hidden2 = {}
-        for inp in soup_vs.find_all("input", {"type": "hidden"}):
-            n = inp.get("name", "")
-            v = inp.get("value", "")
-            if n:
-                hidden2[n] = v
+        # Get viewstate from the rendered page
+        vs2, vsg2, ev2 = await self._get_viewstate(page)
+        hidden2 = await self._get_hidden_fields(page)
 
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
