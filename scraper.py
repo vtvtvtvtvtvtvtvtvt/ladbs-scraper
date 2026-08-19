@@ -1,25 +1,74 @@
 import asyncio
 import logging
 import re
-import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://ladbsdoc.lacity.org/IDISPublic_Records/idis"
 MAIN_URL = "https://ladbsdoc.lacity.org"
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+NAV_TIMEOUT = 30000
+SETTLE_SECONDS = 1.5
+MAX_RESULT_PAGES = 25
+
+DIRECTIONS = {
+    "N", "S", "E", "W", "NE", "NW", "SE", "SW",
+    "NORTH", "SOUTH", "EAST", "WEST",
+}
+STREET_SUFFIXES = {
+    "AVE", "AVENUE", "ST", "STREET", "BLVD", "BOULEVARD", "RD", "ROAD",
+    "DR", "DRIVE", "LN", "LANE", "PL", "PLACE", "CT", "COURT", "WAY",
+    "TER", "TERRACE", "CIR", "CIRCLE", "PKWY", "PARKWAY", "HWY", "HIGHWAY",
+    "TRL", "TRAIL", "PLZ", "PLAZA", "SQ", "SQUARE", "LOOP", "WALK", "PATH",
+    "ALY", "ALLEY", "MALL",
+}
+UNIT_MARKERS = {"UNIT", "APT", "STE", "SUITE", "#", "NO"}
+
+
 def parse_address(raw: str):
-    raw = raw.strip()
-    parts = raw.split(",")
-    street = parts[0].strip()
-    tokens = street.split()
+    """Split a street address into (house_number, street_name, direction).
+
+    LADBS wants the bare street name: no house number, no directional prefix
+    and no street-type suffix. "1234 S San Fernando Rd" -> ("1234", "SAN FERNANDO", "S").
+    """
+    street = (raw or "").strip().split(",")[0].strip()
+    tokens = [t for t in re.split(r"\s+", street) if t]
     if not tokens:
-        raise ValueError(f"Cannot parse address: {raw}")
+        raise ValueError(f"Cannot parse address: {raw!r}")
+
     number = tokens[0]
-    name = tokens[1] if len(tokens) > 1 else ""
-    return number, name
+    if not re.match(r"^\d", number):
+        raise ValueError(f"Address must start with a house number: {raw!r}")
+    number = re.sub(r"[^0-9]", "", number)
+
+    rest = [t.upper().strip(".") for t in tokens[1:]]
+
+    # Drop anything from a unit marker onward ("... UNIT 4", "... #201").
+    for i, tok in enumerate(rest):
+        if tok in UNIT_MARKERS or tok.startswith("#"):
+            rest = rest[:i]
+            break
+
+    direction = ""
+    if rest and rest[0] in DIRECTIONS:
+        direction = rest[0][0] if len(rest[0]) > 2 else rest[0]
+        rest = rest[1:]
+
+    # Drop a trailing street-type suffix, but never the only word left.
+    if len(rest) > 1 and rest[-1] in STREET_SUFFIXES:
+        rest = rest[:-1]
+
+    if not rest:
+        raise ValueError(f"Cannot determine street name from: {raw!r}")
+
+    return number, " ".join(rest), direction
+
 
 def format_ain(ain: str) -> str:
     """Format AIN for LADBS search. LADBS expects format: XXXX-XXX-XXX"""
@@ -27,6 +76,15 @@ def format_ain(ain: str) -> str:
     if len(ain) == 10:
         return f"{ain[0:4]}-{ain[4:7]}-{ain[7:10]}"
     return ain  # return as-is if not 10 digits
+
+
+def split_ain(ain: str):
+    """Split a 10-digit AIN into (book, page, parcel)."""
+    digits = re.sub(r'[^0-9]', '', ain or "")
+    if len(digits) != 10:
+        raise ValueError(f"AIN must be 10 digits, got: {digits!r}")
+    return digits[0:4], digits[4:7], digits[7:10]
+
 
 def parse_results_html(html: str) -> list:
     soup = BeautifulSoup(html, "html.parser")
@@ -97,413 +155,361 @@ def parse_results_html(html: str) -> list:
 
     return records
 
+
+def parse_checkboxes(html: str) -> list:
+    """Parcel/address selection checkboxes on the intermediate LADBS page."""
+    soup = BeautifulSoup(html, "html.parser")
+    pairs = []
+    for cb in soup.find_all("input", {"type": "checkbox"}):
+        name = cb.get("name", "") or ""
+        value = cb.get("value", "") or ""
+        cb_id = cb.get("id", "") or ""
+        if not name:
+            continue
+        if "checkall" in name.lower() or "checkall" in cb_id.lower():
+            continue
+        pairs.append({"name": name, "value": value, "id": cb_id})
+    return pairs
+
+
 class LADBSScraper:
+    """Drives the LADBS IDIS ASP.NET WebForms site in a real browser session.
+
+    Every step (search, parcel selection, paging, detail pages) happens in the
+    same Playwright context, so the ASP.NET session cookie, __VIEWSTATE and
+    __EVENTVALIDATION are always the ones the server just issued. Replaying
+    those tokens out-of-band is what made earlier versions fail intermittently.
+    """
+
+    def __init__(self, headless: bool = True):
+        self.headless = headless
+        self._page = None
+        self._context = None
+        self._diag = None
+
+    # ---------------- public API ----------------
 
     async def scrape(self, address: str) -> dict:
-        """Search by address (legacy)"""
-        number, street_name = parse_address(address)
-        logger.info(f"Parsed: number={number}, street={street_name}")
+        """Search by street address."""
+        number, street_name, direction = parse_address(address)
+        logger.info(f"Parsed: number={number} street={street_name!r} dir={direction!r}")
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        async def worker():
+            self._diag["parsed_address"] = {
+                "number": number, "street": street_name, "direction": direction,
+            }
+            records = await self._collect_records(
+                lambda: self._start_address_search(number, street_name, direction)
             )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            page = await context.new_page()
-            page.set_default_timeout(30000)
-            try:
-                return await self._run_address(page, context, number, street_name, address)
-            finally:
-                await browser.close()
+            return await self._finish(records, "address", address, f"{address}")
+
+        return await self._run(worker)
 
     async def scrape_by_ain(self, ain: str) -> dict:
-        """Search by Assessor Identification Number (APN)"""
-        formatted_ain = format_ain(ain)
-        logger.info(f"Scraping by AIN: {ain} -> formatted: {formatted_ain}")
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-            )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            page = await context.new_page()
-            page.set_default_timeout(30000)
-            try:
-                return await self._run_ain(page, context, formatted_ain, ain)
-            finally:
-                await browser.close()
-
-    async def _goto(self, page, url):
-        logger.info(f"-> {url}")
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        except Exception as e:
-            logger.warning(f"goto warning: {e}")
-        await asyncio.sleep(2)
-
-    async def _get_viewstate(self, page):
-        vs, vsg, ev = "", "", ""
-        try:
-            vs = await page.eval_on_selector("input[name='__VIEWSTATE']", "el => el.value") or ""
-        except: pass
-        try:
-            vsg = await page.eval_on_selector("input[name='__VIEWSTATEGENERATOR']", "el => el.value") or ""
-        except: pass
-        try:
-            ev = await page.eval_on_selector("input[name='__EVENTVALIDATION']", "el => el.value") or ""
-        except: pass
-        return vs, vsg, ev
-
-    async def _get_hidden_fields(self, page):
-        fields = {}
-        hiddens = await page.query_selector_all("input[type='hidden']")
-        for h in hiddens:
-            n = await h.get_attribute("name")
-            v = await h.get_attribute("value") or ""
-            if n:
-                fields[n] = v
-        return fields
-
-    async def _scrape_one_checkbox(self, page, context, cookies, headers, form_url, hidden, vs, vsg, ev, cb_name, cb_val, btn_name="btnSearch", btn_val="Continue"):
-        """Submit the parcel search with a single checkbox and collect all records."""
-        post_data = {**hidden,
-            "__VIEWSTATE": vs,
-            "__VIEWSTATEGENERATOR": vsg,
-            "__EVENTVALIDATION": ev,
-            "__EVENTTARGET": "",
-            "__EVENTARGUMENT": "",
-            btn_name: btn_val,
-            cb_name: cb_val,
-        }
-
-        all_records = []
-        seen_ids = set()
-
-        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
-            resp = await client.post(form_url, data=post_data, headers=headers)
-            logger.info(f"Checkbox POST {cb_name}: {resp.status_code} -> {resp.url}")
-            html = resp.text
-            for k, v in resp.cookies.items():
-                cookies[k] = v
-
-        await page.set_content(html)
-        await asyncio.sleep(1)
-
-        records = parse_results_html(html)
-        for r in records:
-            if r["record_id"] not in seen_ids:
-                seen_ids.add(r["record_id"])
-                all_records.append(r)
-
-        # Handle pagination
-        soup = BeautifulSoup(html, "html.parser")
-        page_nav = soup.find("div", id="pnlNavigate")
-        if page_nav:
-            for pg_link in page_nav.find_all("a"):
-                pg_text = pg_link.get_text(strip=True)
-                if pg_text.isdigit() and int(pg_text) > 1:
-                    logger.info(f"  Page {pg_text}...")
-                    try:
-                        vs2, vsg2, ev2 = await self._get_viewstate(page)
-                        hidden2 = await self._get_hidden_fields(page)
-                        pg_data = {**hidden2,
-                            "__VIEWSTATE": vs2,
-                            "__VIEWSTATEGENERATOR": vsg2,
-                            "__EVENTVALIDATION": ev2,
-                            "__EVENTTARGET": "",
-                            "__EVENTARGUMENT": "",
-                            "PageNavigate": "true",
-                            "PageNo": pg_text,
-                        }
-                        results_url = str(resp.url)
-                        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
-                            pg_resp = await client.post(results_url, data=pg_data, headers=headers)
-                            pg_html = pg_resp.text
-                            for k, v in pg_resp.cookies.items():
-                                cookies[k] = v
-                        pg_records = parse_results_html(pg_html)
-                        for r in pg_records:
-                            if r["record_id"] not in seen_ids:
-                                seen_ids.add(r["record_id"])
-                                all_records.append(r)
-                    except Exception as e:
-                        logger.warning(f"Page {pg_text} failed: {e}")
-
-        logger.info(f"  Total for {cb_name}: {len(all_records)}")
-        return all_records, cookies
-
-    async def _run_ain(self, page, context, formatted_ain, raw_ain):
-        """Search LADBS by AIN (Assessor Identification Number)"""
-        # Parse AIN into Book/Page/Parcel - LADBS uses 3 separate fields
-        ain_clean = re.sub(r'[^0-9]', '', raw_ain)
-        if len(ain_clean) != 10:
-            raise ValueError(f"AIN must be 10 digits, got: {ain_clean}")
-        book   = ain_clean[0:4]
-        pg     = ain_clean[4:7]
-        parcel = ain_clean[7:10]
+        """Search by Assessor Identification Number (APN)."""
+        book, pg, parcel = split_ain(ain)
         logger.info(f"AIN split: book={book} page={pg} parcel={parcel}")
 
-        # Step 1: Navigate to assessor search page via Playwright
-        await self._goto(page, MAIN_URL)
-        await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT")
+        async def worker():
+            self._diag["parsed_ain"] = {"book": book, "page": pg, "parcel": parcel}
+            records = await self._collect_records(
+                lambda: self._start_ain_search(book, pg, parcel)
+            )
+            return await self._finish(records, "ain", ain, f"AIN {format_ain(ain)}")
 
-        # Step 2: Fill and submit assessor form via Playwright
-        try:
-            await page.fill("input[name='Assessor$txtAssessorNoBook']", book)
-            await page.fill("input[name='Assessor$txtAssessorNoPage']", pg)
-            await page.fill("input[name='Assessor$txtAssessorNoParcel']", parcel)
-            logger.info(f"Filled assessor fields: {book} / {pg} / {parcel}")
-        except Exception as e:
-            logger.warning(f"Form fill warning: {e}")
+        return await self._run(worker)
 
-        # Submit the assessor form - try multiple approaches
-        submitted = False
-        try:
-            await page.evaluate("""
-                document.querySelector("input[name='btnSearchAssessor']").click()
-            """)
-            logger.info("Clicked btnSearchAssessor via JS")
-            submitted = True
-        except Exception as e:
-            logger.warning(f"JS click failed: {e}")
+    # ---------------- browser plumbing ----------------
 
-        if not submitted:
+    async def _run(self, worker):
+        self._diag = {"steps": [], "warnings": [], "checkboxes_found": 0, "result_pages": 0}
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=self.headless,
+                args=["--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            context = await browser.new_context(user_agent=USER_AGENT)
+            context.set_default_timeout(NAV_TIMEOUT)
+            self._context = context
+            self._page = await context.new_page()
             try:
-                # Try submitting the form that contains the assessor fields
-                await page.evaluate("""
-                    var btn = document.querySelector("input[name='btnSearchAssessor']");
-                    if (btn) { btn.click(); }
-                    else {
-                        // Find form containing assessor fields and submit
-                        var inp = document.querySelector("input[name='Assessor$txtAssessorNoBook']");
-                        if (inp) inp.closest('form').submit();
-                    }
-                """)
-                submitted = True
-            except Exception as e2:
-                logger.warning(f"Form submit also failed: {e2}")
+                return await worker()
+            finally:
+                await browser.close()
+                self._page = None
+                self._context = None
 
-        await asyncio.sleep(4)
-        html1 = await page.content()
-        cookies = {c["name"]: c["value"] for c in await context.cookies()}
-        logger.info(f"After assessor submit URL: {page.url}")
-        logger.info(f"Address selection HTML length: {len(html1)}")
+    def _step(self, msg):
+        logger.info(msg)
+        self._diag["steps"].append(msg)
 
-        # The checkbox form posts to DocumentSearch.aspx?SearchType=DCMT_ASSR
-        checkbox_form_url = f"{BASE_URL}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
+    def _warn(self, msg):
+        logger.warning(msg)
+        self._diag["warnings"].append(msg)
 
-        # Get viewstate from the rendered page
-        vs2, vsg2, ev2 = await self._get_viewstate(page)
-        hidden2 = await self._get_hidden_fields(page)
+    async def _goto(self, url):
+        self._step(f"goto {url}")
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        except Exception as e:
+            self._warn(f"goto failed for {url}: {e}")
+        await asyncio.sleep(SETTLE_SECONDS)
 
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": checkbox_form_url,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Origin": "https://ladbsdoc.lacity.org",
-        }
+    async def _adopt_popup(self):
+        """LADBS sometimes answers a postback in a new window; follow it."""
+        pages = [p for p in self._context.pages if not p.is_closed()]
+        if len(pages) > 1 and pages[-1] is not self._page:
+            self._page = pages[-1]
+            self._step(f"switched to popup {self._page.url}")
 
-        # Check for direct results first
-        direct_records = parse_results_html(html1)
-        if direct_records:
-            logger.info(f"Direct results: {len(direct_records)} records")
-            all_records = []
-            seen_ids = set()
-            for r in direct_records:
-                if r["record_id"] not in seen_ids:
-                    seen_ids.add(r["record_id"])
-                    all_records.append(r)
-            cb_pairs = []
-        else:
-            # Extract checkboxes from HTML using BeautifulSoup
-            soup1 = BeautifulSoup(html1, "html.parser")
-            cb_inputs = soup1.find_all("input", {"type": "checkbox"})
-            cb_pairs = []
-            for cb in cb_inputs:
-                cb_name = cb.get("name", "")
-                cb_val = cb.get("value", "")
-                cb_id = cb.get("id", "")
-                logger.info(f"Found checkbox: name={cb_name} id={cb_id} val={cb_val[:40]}")
-                # Include chkAddress fields, exclude CheckAll
-                if cb_name and cb_val and cb_name != "CheckAll" and cb_id != "CheckAll":
-                    cb_pairs.append((cb_name, cb_val))
-                    logger.info(f"Added checkbox: {cb_name} = {cb_val[:60]}")
-
-            if not cb_pairs:
-                logger.warning(f"No checkboxes and no direct results for AIN {formatted_ain}")
-                return {
-                    "ain": raw_ain,
-                    "total_records": 0,
-                    "records": [],
-                    "attachments": [],
-                    "summary": f"No records found for AIN {raw_ain}.",
-                }
-            all_records = []
-            seen_ids = set()
-
-        # Step 4: Submit each checkbox individually
-        if cb_pairs:
-            for cb_name, cb_val in cb_pairs:
-                logger.info(f"Processing checkbox: {cb_name}")
-                records, cookies = await self._scrape_one_checkbox(
-                    page, context, cookies, headers, checkbox_form_url,
-                    hidden2, vs2, vsg2, ev2, cb_name, cb_val,
-                    btn_name="btnNext2", btn_val="Continue"
-                )
-                for r in records:
-                    if r["record_id"] not in seen_ids:
-                        seen_ids.add(r["record_id"])
-                        all_records.append(r)
-
-        logger.info(f"Total unique records: {len(all_records)}")
-
-        if not all_records:
-            return {
-                "ain": raw_ain,
-                "total_records": 0,
-                "records": [],
-                "attachments": [],
-                "summary": f"No records found for AIN {raw_ain}.",
-            }
-
-        # Step 5: Scrape detail pages
-        detailed = []
-        all_attachments = []
-
-        for i, rec in enumerate(all_records):
-            logger.info(f"Detail {i+1}/{len(all_records)}: {rec['doc_type']} {rec['doc_number']}")
+    async def _fill_first(self, selectors, value, label):
+        for sel in selectors:
             try:
-                await self._goto(page, rec["detail_url"])
-                detail_html = await page.content()
-                if "SessionExpired" in page.url or "IdisError" in page.url:
-                    logger.warning(f"Session expired on detail {i+1}")
-                    rec["detail_error"] = "Session expired"
-                else:
-                    detail = self._parse_detail_html(detail_html)
-                    rec.update(detail)
+                loc = self._page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                await loc.fill(value, timeout=5000)
+                self._step(f"filled {label} ({sel}) = {value}")
+                return True
             except Exception as e:
-                logger.warning(f"Detail {i+1} failed: {e}")
-                rec["detail_error"] = str(e)
+                self._warn(f"fill {label} via {sel} failed: {e}")
+        self._warn(f"no field matched for {label}; tried {selectors}")
+        return False
 
-            detailed.append(rec)
-            all_attachments.extend(rec.get("attachments", []))
+    async def _click_first(self, selectors, label, required=True):
+        for sel in selectors:
+            try:
+                loc = self._page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+            except Exception:
+                continue
+            self._step(f"click {label} ({sel})")
+            await self._click_and_wait(loc)
+            await self._adopt_popup()
+            return True
+        msg = f"no clickable element for {label}; tried {selectors}"
+        if required:
+            self._warn(msg)
+        return False
 
-        return {
-            "ain": raw_ain,
-            "total_records": len(detailed),
-            "records": detailed,
-            "attachments": all_attachments,
-            "summary": self._build_summary(detailed, f"AIN {raw_ain}"),
-        }
+    async def _click_and_wait(self, locator):
+        """Click a WebForms control and wait for the resulting postback."""
+        try:
+            async with self._page.expect_navigation(
+                wait_until="domcontentloaded", timeout=NAV_TIMEOUT
+            ):
+                await locator.click(timeout=NAV_TIMEOUT)
+        except PlaywrightTimeoutError:
+            # Some controls update in place instead of navigating.
+            try:
+                await self._page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+        except Exception as e:
+            self._warn(f"click failed: {e}")
+        await asyncio.sleep(SETTLE_SECONDS)
 
-    async def _run_address(self, page, context, number, street_name, raw_address):
-        """Search LADBS by address (legacy method)"""
-        await self._goto(page, MAIN_URL)
-        await self._goto(page, f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
+    # ---------------- search entry points ----------------
 
-        vs, vsg, ev = await self._get_viewstate(page)
-        hidden = await self._get_hidden_fields(page)
-        cookies = {c["name"]: c["value"] for c in await context.cookies()}
+    async def _start_ain_search(self, book, pg, parcel):
+        await self._goto(MAIN_URL)
+        await self._goto(f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ASMT")
 
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Origin": "https://ladbsdoc.lacity.org",
-        }
+        await self._fill_first(
+            ["input[name='Assessor$txtAssessorNoBook']", "input[id*='AssessorNoBook']"],
+            book, "assessor book")
+        await self._fill_first(
+            ["input[name='Assessor$txtAssessorNoPage']", "input[id*='AssessorNoPage']"],
+            pg, "assessor page")
+        await self._fill_first(
+            ["input[name='Assessor$txtAssessorNoParcel']", "input[id*='AssessorNoParcel']"],
+            parcel, "assessor parcel")
 
-        form_url = f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR"
-        post_data = {**hidden,
-            "__VIEWSTATE": vs,
-            "__VIEWSTATEGENERATOR": vsg,
-            "__EVENTVALIDATION": ev,
-            "__EVENTTARGET": "",
-            "__EVENTARGUMENT": "",
-            "Address$txtAddressBegNo": number,
-            "Address$txtAddressStreetName": street_name,
-            "btnNext1": "Next",
-        }
+        await self._click_first(
+            ["input[name='btnSearchAssessor']",
+             "input[id='btnSearchAssessor']",
+             "input[type='submit'][value='Search']",
+             "input[type='submit']"],
+            "assessor search")
+        self._step(f"after assessor search: {self._page.url}")
 
-        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=30) as client:
-            resp = await client.post(form_url, data=post_data, headers=headers)
-            logger.info(f"Search POST: {resp.status_code} -> {resp.url}")
-            html1 = resp.text
-            for k, v in resp.cookies.items():
-                cookies[k] = v
+    async def _start_address_search(self, number, street_name, direction):
+        await self._goto(MAIN_URL)
+        await self._goto(f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
 
-        await page.set_content(html1)
-        await asyncio.sleep(1)
+        await self._fill_first(
+            ["input[name='Address$txtAddressBegNo']", "input[id*='AddressBegNo']"],
+            number, "house number")
+        await self._fill_first(
+            ["input[name='Address$txtAddressStreetName']", "input[id*='AddressStreetName']"],
+            street_name, "street name")
+        if direction:
+            await self._fill_first(
+                ["input[name='Address$txtAddressDirection']", "input[id*='AddressDirection']"],
+                direction, "direction")
 
-        checkboxes = await page.query_selector_all("input[type='checkbox']:not([id*='All'])")
-        cb_pairs = []
-        for cb in checkboxes:
-            cb_name = await cb.get_attribute("name") or ""
-            cb_val = await cb.get_attribute("value") or ""
-            if cb_name and cb_val:
-                cb_pairs.append((cb_name, cb_val))
-                logger.info(f"Checkbox: {cb_name} = {cb_val[:50]}")
+        await self._click_first(
+            ["input[name='btnNext1']",
+             "input[id='btnNext1']",
+             "input[type='submit'][value='Next']",
+             "input[type='submit']"],
+            "address search")
+        self._step(f"after address search: {self._page.url}")
 
-        vs2, vsg2, ev2 = await self._get_viewstate(page)
-        hidden2 = await self._get_hidden_fields(page)
+    # ---------------- selection / results ----------------
+
+    async def _collect_records(self, restart):
+        """Run the search, then walk every parcel selection the site offers."""
+        await restart()
+        html = await self._page.content()
+
+        direct = parse_results_html(html)
+        if direct:
+            self._step(f"search landed straight on results: {len(direct)} record(s)")
+            records = direct + await self._paginate()
+            return self._dedupe(records)
+
+        checkboxes = parse_checkboxes(html)
+        self._diag["checkboxes_found"] = len(checkboxes)
+        self._step(f"selection page has {len(checkboxes)} parcel checkbox(es)")
+
+        if not checkboxes:
+            self._warn(
+                f"no results grid and no parcel checkboxes at {self._page.url} "
+                f"(page length {len(html)})"
+            )
+            self._diag["final_html_len"] = len(html)
+            return []
 
         all_records = []
-        seen_ids = set()
+        for idx, cb in enumerate(checkboxes):
+            if idx > 0:
+                # Re-run the search so each selection starts from a fresh,
+                # server-issued __VIEWSTATE instead of a stale one.
+                await restart()
+            self._step(f"selecting checkbox {idx + 1}/{len(checkboxes)}: {cb['name']}")
+            if not await self._check_and_continue(cb):
+                continue
+            page_records = parse_results_html(await self._page.content())
+            page_records += await self._paginate()
+            self._step(f"  checkbox {idx + 1} yielded {len(page_records)} record(s)")
+            all_records.extend(page_records)
 
-        for cb_name, cb_val in cb_pairs:
-            logger.info(f"Processing checkbox: {cb_name}")
-            records, cookies = await self._scrape_one_checkbox(
-                page, context, cookies, headers, form_url,
-                hidden2, vs2, vsg2, ev2, cb_name, cb_val
-            )
-            for r in records:
-                if r["record_id"] not in seen_ids:
-                    seen_ids.add(r["record_id"])
-                    all_records.append(r)
+        return self._dedupe(all_records)
 
-        logger.info(f"Total unique records: {len(all_records)}")
+    async def _check_and_continue(self, cb):
+        selectors = []
+        if cb.get("id"):
+            selectors.append(f'input[type="checkbox"][id="{cb["id"]}"]')
+        if cb.get("value"):
+            selectors.append(
+                f'input[type="checkbox"][name="{cb["name"]}"][value="{cb["value"]}"]')
+        selectors.append(f'input[type="checkbox"][name="{cb["name"]}"]')
 
-        if not all_records:
+        checked = False
+        for sel in selectors:
+            try:
+                loc = self._page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                await loc.check(timeout=5000)
+                checked = True
+                break
+            except Exception as e:
+                self._warn(f"check {cb['name']} via {sel} failed: {e}")
+        if not checked:
+            self._warn(f"could not check checkbox {cb['name']}")
+            return False
+
+        return await self._click_first(
+            ["input[name='btnNext2']",
+             "input[id='btnNext2']",
+             "input[type='submit'][value='Continue']",
+             "input[name='btnSearch']",
+             "input[type='submit']"],
+            "continue to documents")
+
+    async def _paginate(self):
+        """Click through the numbered result pages, if any."""
+        extra = []
+        visited = {1}
+        while len(visited) < MAX_RESULT_PAGES:
+            soup = BeautifulSoup(await self._page.content(), "html.parser")
+            nav = soup.find(id="pnlNavigate")
+            if not nav:
+                break
+            next_page = None
+            for a in nav.find_all("a"):
+                text = a.get_text(strip=True)
+                if text.isdigit() and int(text) not in visited:
+                    next_page = text
+                    break
+            if not next_page:
+                break
+            visited.add(int(next_page))
+            self._step(f"  result page {next_page}")
+            clicked = await self._click_first(
+                [f"#pnlNavigate a:text-is('{next_page}')"],
+                f"result page {next_page}", required=False)
+            if not clicked:
+                self._warn(f"could not open result page {next_page}")
+                break
+            extra.extend(parse_results_html(await self._page.content()))
+        self._diag["result_pages"] = max(self._diag["result_pages"], len(visited))
+        return extra
+
+    @staticmethod
+    def _dedupe(records):
+        seen = set()
+        out = []
+        for r in records:
+            if r["record_id"] in seen:
+                continue
+            seen.add(r["record_id"])
+            out.append(r)
+        return out
+
+    # ---------------- detail pages ----------------
+
+    async def _finish(self, records, key, key_value, identifier):
+        self._step(f"total unique records: {len(records)}")
+        if not records:
             return {
-                "address": raw_address,
+                key: key_value,
                 "total_records": 0,
                 "records": [],
                 "attachments": [],
-                "summary": "No records found.",
+                "summary": f"No records found for {identifier}.",
+                "diagnostics": self._diag,
             }
 
         detailed = []
         all_attachments = []
-
-        for i, rec in enumerate(all_records):
-            logger.info(f"Detail {i+1}/{len(all_records)}: {rec['doc_type']} {rec['doc_number']}")
+        for i, rec in enumerate(records):
+            logger.info(f"Detail {i+1}/{len(records)}: {rec['doc_type']} {rec['doc_number']}")
             try:
-                await self._goto(page, rec["detail_url"])
-                detail_html = await page.content()
-                if "SessionExpired" in page.url or "IdisError" in page.url:
-                    logger.warning(f"Session expired on detail {i+1}")
+                await self._goto(rec["detail_url"])
+                if "SessionExpired" in self._page.url or "IdisError" in self._page.url:
+                    self._warn(f"session expired on detail {i+1}")
                     rec["detail_error"] = "Session expired"
                 else:
-                    detail = self._parse_detail_html(detail_html)
-                    rec.update(detail)
+                    rec.update(self._parse_detail_html(await self._page.content()))
             except Exception as e:
-                logger.warning(f"Detail {i+1} failed: {e}")
+                self._warn(f"detail {i+1} failed: {e}")
                 rec["detail_error"] = str(e)
 
             detailed.append(rec)
             all_attachments.extend(rec.get("attachments", []))
 
         return {
-            "address": raw_address,
+            key: key_value,
             "total_records": len(detailed),
             "records": detailed,
             "attachments": all_attachments,
-            "summary": self._build_summary(detailed, raw_address),
+            "summary": self._build_summary(detailed, identifier),
+            "diagnostics": self._diag,
         }
 
     def _parse_detail_html(self, html: str) -> dict:

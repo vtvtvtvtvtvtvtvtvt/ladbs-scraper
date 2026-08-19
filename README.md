@@ -140,7 +140,16 @@ async function searchLADBS(address: string) {
 ```bash
 # Install deps
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 playwright install chromium
+
+# Offline test suite — parsers plus a full browser run against a mock
+# LADBS site. No internet needed; this is what to run after any change.
+python -m pytest tests/ -q
+
+# One-off live scrape straight from the CLI
+python test_scraper.py "2100 Cypress Ave, Los Angeles, CA 90065"
+python test_scraper.py --ain 5443-016-018
 
 # Run the server
 uvicorn main:app --reload --port 8000
@@ -150,6 +159,35 @@ curl -X POST http://localhost:8000/scrape \
   -H "Content-Type: application/json" \
   -d '{"address": "2100 Cypress Ave, Los Angeles, CA 90065"}'
 ```
+
+---
+
+## Troubleshooting
+
+Every `/scrape` response carries a `diagnostics` object — the steps the scraper
+took, the URLs it landed on, how many parcel checkboxes it saw, and any
+warnings. When a scrape comes back with `total_records: 0`, read that first;
+the same lines are written to the Railway logs.
+
+| What you see | Likely cause |
+| --- | --- |
+| `no results grid and no parcel checkboxes at <url>` | LADBS returned a page the scraper didn't recognise — usually a session-expired or "no parcels matched" page. Check the `steps` for the URL and open it in a browser. |
+| `no field matched for <field>` | LADBS renamed a form input. Update the selector list in `scraper.py`. |
+| `checkboxes_found: 0` on a real parcel | The first search step didn't match — check `parsed_address` / `parsed_ain` in the diagnostics. |
+| `detail_error: Session expired` | The detail page was requested outside the search session. |
+| Empty records but no warnings | The parcel genuinely has no IDIS documents. |
+
+**Address parsing:** LADBS wants the bare street name. `parse_address` strips
+the house number, a directional prefix and the street-type suffix, so
+`1234 S San Fernando Rd` is searched as number `1234`, direction `S`, street
+`SAN FERNANDO`.
+
+**Why the scraper drives a real browser:** LADBS IDIS is ASP.NET WebForms, so
+every form post must carry the `__VIEWSTATE` / `__EVENTVALIDATION` pair the
+server issued for *that* page in *that* session. The scraper therefore performs
+every step — search, parcel selection, paging and detail pages — in one
+Playwright context, and never replays captured tokens over a separate HTTP
+client.
 
 ---
 

@@ -36,6 +36,16 @@ class ScrapeRequest(BaseModel):
 def health():
     return {"status": "ok"}
 
+def _log_if_empty(result: dict, identifier: str):
+    """An empty result is usually a broken flow, not an empty parcel — say why."""
+    if result.get("total_records"):
+        return
+    diag = result.get("diagnostics", {}) or {}
+    logger.warning(f"No records for {identifier}. Steps: {diag.get('steps')}")
+    for warning in diag.get("warnings", []):
+        logger.warning(f"  ! {warning}")
+
+
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
     scraper = LADBSScraper()
@@ -45,6 +55,7 @@ async def scrape(request: ScrapeRequest):
         logger.info(f"Scrape request by AIN: {request.ain}")
         try:
             result = await scraper.scrape_by_ain(request.ain)
+            _log_if_empty(result, f"AIN {request.ain}")
             return result
         except Exception as e:
             logger.error(f"AIN scrape failed: {e}")
@@ -54,6 +65,7 @@ async def scrape(request: ScrapeRequest):
         logger.info(f"Scrape request by address: {request.address}")
         try:
             result = await scraper.scrape(request.address)
+            _log_if_empty(result, request.address)
             return result
         except Exception as e:
             logger.error(f"Address scrape failed: {e}")
