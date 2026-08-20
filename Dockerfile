@@ -12,5 +12,7 @@ COPY . .
 
 EXPOSE 8000
 
-# Railway injects $PORT; fall back to 8000 for local runs.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Bind the exposed port directly. Railway routes to 8000 for this service, so
+# do not swap in $PORT: if the platform sets PORT to something else while still
+# routing to 8000, the proxy gets nothing and every request comes back 502.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

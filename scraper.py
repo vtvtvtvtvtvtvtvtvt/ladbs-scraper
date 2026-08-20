@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import os
 import re
+import time
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -16,6 +18,11 @@ USER_AGENT = (
 NAV_TIMEOUT = 30000
 SETTLE_SECONDS = 1.5
 MAX_RESULT_PAGES = 25
+
+# A scrape must always answer, even on a parcel with hundreds of documents.
+# Past this many seconds it stops collecting and returns what it has, flagged
+# as truncated, rather than letting the caller time out with nothing.
+SCRAPE_BUDGET_SECONDS = float(os.environ.get("SCRAPE_TIMEOUT_SECONDS", "150"))
 
 DIRECTIONS = {
     "N", "S", "E", "W", "NE", "NW", "SE", "SW",
@@ -226,11 +233,14 @@ class LADBSScraper:
     those tokens out-of-band is what made earlier versions fail intermittently.
     """
 
-    def __init__(self, headless: bool = True):
+    def __init__(self, headless: bool = True, budget_seconds: float = None):
         self.headless = headless
+        self.budget_seconds = (
+            SCRAPE_BUDGET_SECONDS if budget_seconds is None else budget_seconds)
         self._page = None
         self._context = None
         self._diag = None
+        self._deadline = None
 
     # ---------------- public API ----------------
 
@@ -279,7 +289,12 @@ class LADBSScraper:
     # ---------------- browser plumbing ----------------
 
     async def _run(self, worker):
-        self._diag = {"steps": [], "warnings": [], "checkboxes_found": 0, "result_pages": 0}
+        started = time.monotonic()
+        self._deadline = started + self.budget_seconds
+        self._diag = {
+            "steps": [], "warnings": [], "checkboxes_found": 0, "result_pages": 0,
+            "truncated": False, "time_budget_seconds": self.budget_seconds,
+        }
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=self.headless,
@@ -293,9 +308,20 @@ class LADBSScraper:
             try:
                 return await worker()
             finally:
+                self._diag["elapsed_seconds"] = round(time.monotonic() - started, 1)
                 await browser.close()
                 self._page = None
                 self._context = None
+
+    def _time_left(self) -> float:
+        return float("inf") if self._deadline is None else self._deadline - time.monotonic()
+
+    def _out_of_time(self, what: str) -> bool:
+        if self._time_left() > 0:
+            return False
+        self._diag["truncated"] = True
+        self._warn(f"{self.budget_seconds:.0f}s time budget spent — {what}")
+        return True
 
     def _step(self, msg):
         logger.info(msg)
@@ -305,13 +331,15 @@ class LADBSScraper:
         logger.warning(msg)
         self._diag["warnings"].append(msg)
 
-    async def _goto(self, url):
+    async def _goto(self, url, settle: float = SETTLE_SECONDS):
         self._step(f"goto {url}")
+        timeout = max(5000, min(NAV_TIMEOUT, int(self._time_left() * 1000)))
         try:
-            await self._page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=timeout)
         except Exception as e:
             self._warn(f"goto failed for {url}: {e}")
-        await asyncio.sleep(SETTLE_SECONDS)
+        if settle:
+            await asyncio.sleep(settle)
 
     async def _adopt_popup(self):
         """LADBS sometimes answers a postback in a new window; follow it."""
@@ -442,6 +470,9 @@ class LADBSScraper:
 
         all_records = []
         for idx, cb in enumerate(checkboxes):
+            if self._out_of_time(
+                    f"stopped after {idx} of {len(checkboxes)} parcel(s)"):
+                break
             if idx > 0:
                 # Re-run the search so each selection starts from a fresh,
                 # server-issued __VIEWSTATE instead of a stale one.
@@ -505,6 +536,8 @@ class LADBSScraper:
                     break
             if not next_page:
                 break
+            if self._out_of_time(f"stopped before result page {next_page}"):
+                break
             visited.add(int(next_page))
             self._step(f"  result page {next_page}")
             clicked = await self._click_first(
@@ -552,9 +585,18 @@ class LADBSScraper:
         detailed = []
         all_attachments = []
         for i, rec in enumerate(records):
+            if self._out_of_time(
+                    f"skipped detail lookups for {len(records) - i} record(s)"):
+                for skipped in records[i:]:
+                    skipped["detail_error"] = "skipped: scrape time budget spent"
+                    detailed.append(skipped)
+                    all_attachments.extend(skipped.get("attachments", []))
+                break
+
             logger.info(f"Detail {i+1}/{len(records)}: {rec['doc_type']} {rec['doc_number']}")
             try:
-                await self._goto(rec["detail_url"])
+                # Report.aspx is a static page; no settle needed.
+                await self._goto(rec["detail_url"], settle=0.2)
                 if "SessionExpired" in self._page.url or "IdisError" in self._page.url:
                     self._warn(f"session expired on detail {i+1}")
                     rec["detail_error"] = "Session expired"
@@ -602,4 +644,9 @@ class LADBSScraper:
         for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
             lines.append(f"  • {t}: {c}")
         lines.append(f"Total attachments available: {total_attachments}")
+        if self._diag and self._diag.get("truncated"):
+            lines.append(
+                f"NOTE: stopped at the {self.budget_seconds:.0f}s time limit — "
+                f"this list may be incomplete. Raise SCRAPE_TIMEOUT_SECONDS to "
+                f"collect more.")
         return "\n".join(lines)

@@ -118,3 +118,36 @@ class TestCrmInputs:
         assert result["total_records"] == 0
         assert result["diagnostics"]["outside_jurisdiction"] == "Pasadena"
         assert "outside the City of Los Angeles" in result["summary"]
+
+
+class TestTimeBudget:
+    """A scrape must always answer — a caller that times out gets a 502."""
+
+    def test_tiny_budget_still_returns_a_response(self):
+        with MockLADBS() as mock:
+            old = scraper_mod.BASE_URL, scraper_mod.MAIN_URL
+            scraper_mod.BASE_URL = f"{mock.base}{IDIS}"
+            scraper_mod.MAIN_URL = mock.base
+            try:
+                s = LADBSScraper(budget_seconds=0.001)
+                result = asyncio.run(s.scrape_by_ain("5443-016-018"))
+            finally:
+                scraper_mod.BASE_URL, scraper_mod.MAIN_URL = old
+
+        assert result["diagnostics"]["truncated"] is True
+        assert isinstance(result["total_records"], int)
+        assert "elapsed_seconds" in result["diagnostics"]
+
+    def test_normal_budget_is_not_truncated(self, ain_result):
+        assert ain_result["diagnostics"]["truncated"] is False
+        assert ain_result["diagnostics"]["elapsed_seconds"] > 0
+
+    def test_budget_reads_from_env(self, monkeypatch):
+        import importlib
+        monkeypatch.setenv("SCRAPE_TIMEOUT_SECONDS", "42")
+        importlib.reload(scraper_mod)
+        try:
+            assert scraper_mod.LADBSScraper().budget_seconds == 42.0
+        finally:
+            monkeypatch.delenv("SCRAPE_TIMEOUT_SECONDS")
+            importlib.reload(scraper_mod)
