@@ -313,6 +313,39 @@ class LADBSScraper:
                 self._page = None
                 self._context = None
 
+    async def _snapshot(self) -> dict:
+        """Describe the page the scrape ended on.
+
+        When nothing is found the question is always "what did LADBS actually
+        send back?" — a session-expired notice, a no-match page, or a redesign
+        the selectors no longer match. The field inventory answers the last
+        one: if LADBS renames its inputs, the new names show up here.
+        """
+        try:
+            html = await self._page.content()
+            url = self._page.url
+        except Exception as e:
+            return {"error": f"could not read the page: {e}"}
+
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+
+        fields = []
+        for el in soup.find_all(["input", "select", "textarea"]):
+            name = el.get("name") or el.get("id")
+            if name and "__" not in name:  # skip __VIEWSTATE and friends
+                fields.append(f"{el.name}[{el.get('type', '')}] {name}")
+
+        return {
+            "url": url,
+            "title": soup.title.get_text(strip=True) if soup.title else "",
+            "has_results_grid": soup.find(id="grdIdisResult") is not None,
+            "html_length": len(html),
+            "form_fields": fields[:40],
+            "visible_text": re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:1500],
+        }
+
     def _time_left(self) -> float:
         return float("inf") if self._deadline is None else self._deadline - time.monotonic()
 
@@ -566,6 +599,7 @@ class LADBSScraper:
     async def _finish(self, records, key, key_value, identifier):
         self._step(f"total unique records: {len(records)}")
         if not records:
+            self._diag["page_snapshot"] = await self._snapshot()
             summary = f"No records found for {identifier}."
             outside = self._diag.get("outside_jurisdiction")
             if outside:

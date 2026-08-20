@@ -44,6 +44,12 @@ def _log_if_empty(result: dict, identifier: str):
     logger.warning(f"No records for {identifier}. Steps: {diag.get('steps')}")
     for warning in diag.get("warnings", []):
         logger.warning(f"  ! {warning}")
+    snap = diag.get("page_snapshot")
+    if snap:
+        logger.warning(f"  page it ended on: {snap.get('url')}")
+        logger.warning(f"  title: {snap.get('title')!r} grid={snap.get('has_results_grid')}")
+        logger.warning(f"  fields: {snap.get('form_fields')}")
+        logger.warning(f"  text: {snap.get('visible_text')}")
 
 
 @app.post("/scrape")

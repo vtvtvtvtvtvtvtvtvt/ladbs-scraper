@@ -151,3 +151,23 @@ class TestTimeBudget:
         finally:
             monkeypatch.delenv("SCRAPE_TIMEOUT_SECONDS")
             importlib.reload(scraper_mod)
+
+
+class TestEmptyResultSnapshot:
+    """An empty result must carry evidence of what LADBS actually sent."""
+
+    def test_snapshot_describes_the_page(self):
+        result = run_scrape("ain", "1111-222-333")   # no such parcel
+        snap = result["diagnostics"]["page_snapshot"]
+        assert snap["url"]
+        assert snap["has_results_grid"] is False
+        assert "No parcels matched" in snap["visible_text"]
+        assert snap["html_length"] > 0
+
+    def test_snapshot_lists_form_fields_but_not_viewstate(self):
+        result = run_scrape("address", "9999 Nowhere St")
+        fields = result["diagnostics"]["page_snapshot"]["form_fields"]
+        assert not any("__VIEWSTATE" in f for f in fields)
+
+    def test_successful_scrape_carries_no_snapshot(self, ain_result):
+        assert "page_snapshot" not in ain_result["diagnostics"]
