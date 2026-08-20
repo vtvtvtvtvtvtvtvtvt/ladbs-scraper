@@ -21,7 +21,8 @@ from mock_ladbs import MockLADBS, IDIS
 
 scraper_mod.SETTLE_SECONDS = 0.05
 
-WINDOW_AIN = "5467-018-015"   # 5 pages behind a 3-wide pager, 25 records
+PAGER_AIN = "5468-018-015"    # one address, 5 pages behind a 3-wide pager
+MUSEUM_AIN = "5467-018-015"   # two address rows: "234 MUSEUM DR" and "234 W MUSEUM DR"
 
 
 def scrape(value, **kwargs):
@@ -38,7 +39,12 @@ def scrape(value, **kwargs):
 
 @pytest.fixture(scope="module")
 def windowed():
-    return scrape(WINDOW_AIN)
+    return scrape(PAGER_AIN)
+
+
+@pytest.fixture(scope="module")
+def museum():
+    return scrape(MUSEUM_AIN)
 
 
 class TestWindowedPager:
@@ -60,7 +66,7 @@ class TestWindowedPager:
 
     def test_a_short_read_is_reported_as_truncated(self):
         # If the budget stops paging early, it must NOT claim a clean finish.
-        result = scrape(WINDOW_AIN, budget_seconds=10)
+        result = scrape(PAGER_AIN, budget_seconds=10)
         if result["diagnostics"]["result_pages"] < 5:
             assert result["diagnostics"]["truncated"] is True
 
@@ -130,10 +136,83 @@ class TestGuidExtraction:
 
 class TestDebugCapture:
     def test_debug_returns_real_markup(self):
-        diag = scrape(WINDOW_AIN, debug=True)["diagnostics"]
+        diag = scrape(PAGER_AIN, debug=True)["diagnostics"]
         assert "grdIdisResult" not in diag["grid_html_sample"]  # rows only
         assert "OpenWindow(" in diag["grid_html_sample"]
         assert diag["pager_html"] and "pnlNavigate" in diag["pager_html"]
 
     def test_debug_is_off_by_default(self, windowed):
         assert "grid_html_sample" not in windowed["diagnostics"]
+
+
+class TestEveryMatchingAddressRow:
+    """A search can match several address rows that differ only by direction.
+
+    "234 Museum Dr" returns both "234 MUSEUM DR" and "234 W MUSEUM DR".
+    Taking one of them silently halves the results.
+    """
+
+    def test_both_address_rows_are_found(self, museum):
+        assert museum["diagnostics"]["checkboxes_found"] == 2
+
+    def test_page_controls_are_not_mistaken_for_addresses(self, museum):
+        # The page also carries All Fields / Frac / Unit / Zip Code and an
+        # "All" toggle. Counting those as parcels submits a display option.
+        labels = " ".join(museum["diagnostics"]["parcels"]).lower()
+        for control in ("all fields", "frac", "unit", "zip code"):
+            assert control not in labels
+
+    def test_both_rows_are_selected_by_name(self, museum):
+        labels = museum["diagnostics"]["parcels"]
+        assert any("W MUSEUM" in lb for lb in labels)
+        assert any(lb.strip().startswith("234") and "W" not in lb.split()
+                   for lb in labels)
+
+    def test_records_from_both_rows_come_back(self, museum):
+        # 25 from "234 MUSEUM DR" + 6 from "234 W MUSEUM DR"
+        assert museum["total_records"] == 31
+
+    def test_the_second_rows_records_are_present(self, museum):
+        numbers = {r["doc_number"] for r in museum["records"]}
+        assert any(n.startswith("1955LA") for n in numbers), \
+            "records from the W Museum row are missing"
+
+
+class TestParcelTableDetection:
+    def test_display_field_checkboxes_are_excluded(self):
+        from scraper import parse_checkboxes
+        html = """
+        <html><body>
+          <input type="checkbox" name="AllFields"/>All Fields
+          <input type="checkbox" name="Frac"/>Frac
+          <input type="checkbox" name="Unit"/>Unit
+          <input type="checkbox" name="ZipCode"/>Zip Code
+          <input type="checkbox" name="All"/>All
+          <table>
+            <tr><th>Select</th><th>Beg Nbr</th><th>End Nbr</th>
+                <th>Dir</th><th>Str Name</th><th>Str Type</th></tr>
+            <tr><td><input type="checkbox" name="c$0" value="a"/></td>
+                <td>234</td><td></td><td></td><td>MUSEUM</td><td>DR</td></tr>
+            <tr><td><input type="checkbox" name="c$1" value="b"/></td>
+                <td>234</td><td></td><td>W</td><td>MUSEUM</td><td>DR</td></tr>
+          </table>
+        </body></html>"""
+        found = parse_checkboxes(html)
+        assert [c["name"] for c in found] == ["c$0", "c$1"]
+
+    def test_row_labels_describe_the_address(self):
+        from scraper import parse_checkboxes
+        html = """<table>
+            <tr><th>Select</th><th>Beg Nbr</th><th>Dir</th><th>Str Name</th></tr>
+            <tr><td><input type="checkbox" name="c$1" value="b"/></td>
+                <td>234</td><td>W</td><td>MUSEUM</td></tr></table>"""
+        assert "234 W MUSEUM" in parse_checkboxes(html)[0]["label"]
+
+    def test_falls_back_when_there_is_no_grid(self):
+        from scraper import parse_checkboxes
+        html = """<html><body>
+            <input type="checkbox" name="AllFields"/>
+            <input type="checkbox" name="CheckAll"/>
+            <input type="checkbox" name="chkAddress$0" value="234 MUSEUM DR"/>
+        </body></html>"""
+        assert [c["name"] for c in parse_checkboxes(html)] == ["chkAddress$0"]

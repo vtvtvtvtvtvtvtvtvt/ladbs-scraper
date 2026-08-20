@@ -60,8 +60,11 @@ for _p in FAN_PARCELS:
 # A parcel like 234 Museum Dr: 5 pages behind a windowed pager, and rows whose
 # image pane defaults to Hidden even though the document has an image.
 WINDOW_LABEL = "234 MUSEUM DR"
-WINDOW_PARCELS = [{"id": "chkAddress$5", "dom_id": "chkAddress_5",
-                   "label": WINDOW_LABEL}]
+WINDOW_LABEL_W = "234 W MUSEUM DR"
+WINDOW_PARCELS = [
+    {"id": "chkAddress$5", "dom_id": "chkAddress_5", "label": WINDOW_LABEL},
+    {"id": "chkAddress$6", "dom_id": "chkAddress_6", "label": WINDOW_LABEL_W},
+]
 RECORDS[WINDOW_LABEL] = {
     page: [(f"{800 + page * 10 + j}", "Building Permit", "Alteration",
             "04/10/1983", f"1983LA{64434 + page * 10 + j}",
@@ -70,6 +73,23 @@ RECORDS[WINDOW_LABEL] = {
             "{%08d-aaaa-bbbb-cccc-%012d}" % (page, j) if j < 4 else "")
            for j in range(5)]
     for page in range(1, 6)
+}
+
+PAGER_LABEL = "500 DEEP AVE"
+PAGER_PARCELS = [{"id": "chkAddress$7", "dom_id": "chkAddress_7",
+                  "label": PAGER_LABEL}]
+RECORDS[PAGER_LABEL] = {
+    page: [(f"{600 + page * 10 + j}", "Building Permit", "Alteration",
+            "04/10/1983", f"1983LA{64434 + page * 10 + j}",
+            "{%08d-aaaa-bbbb-cccc-%012d}" % (page, j) if j < 4 else "")
+           for j in range(5)]
+    for page in range(1, 6)
+}
+
+RECORDS[WINDOW_LABEL_W] = {
+    1: [(f"{900 + j}", "Building Permit", "New", "06/01/1955",
+         f"1955LA{16019 + j}", "{99999999-aaaa-bbbb-cccc-%012d}" % j)
+        for j in range(6)]
 }
 
 _counter = itertools.count(1)
@@ -138,7 +158,7 @@ def _results_page(labels, page_no, viewstate):
     nav = ""
     if len(pages) > 1:
         all_pages = sorted(pages)
-        windowed = WINDOW_LABEL in labels
+        windowed = len(all_pages) > 3
         if windowed:
             start = ((page_no - 1) // 3) * 3
             shown = all_pages[start:start + 3]
@@ -286,8 +306,10 @@ class Handler(BaseHTTPRequestHandler):
                        one("Assessor$txtAssessorNoParcel"))
                 if ain == ("9999", "999", "999"):        # high-history parcel
                     ok, parcels = True, BULK_PARCELS
-                elif ain == ("5467", "018", "015"):      # windowed pager, 5 pages
+                elif ain == ("5467", "018", "015"):      # two address rows
                     ok, parcels = True, WINDOW_PARCELS
+                elif ain == ("5468", "018", "015"):      # 5 pages, windowed pager
+                    ok, parcels = True, PAGER_PARCELS
                 elif ain == ("7777", "777", "777"):      # 24-parcel address
                     ok, parcels = True, FAN_PARCELS
                 elif ain == ("4030", "030", "030"):      # upstream refuses us
@@ -308,11 +330,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(
                     "<html><body>No parcels matched your search.</body></html>", sid, is_new)
 
-            boxes = ["<input type='checkbox' id='CheckAll' name='CheckAll' value='on'/> All<br/>"]
-            for p in parcels:
+            # Mirrors the real page: unrelated "Display Fields" checkboxes and
+            # an "All" toggle sit outside the address grid.
+            boxes = [
+                "<div>Display Fields "
+                "<input type='checkbox' id='AllFields' name='AllFields'/>All Fields"
+                "<input type='checkbox' id='Frac' name='Frac'/>Frac"
+                "<input type='checkbox' id='Unit' name='Unit'/>Unit"
+                "<input type='checkbox' id='ZipCode' name='ZipCode'/>Zip Code"
+                "</div>",
+                "<input type='checkbox' id='All' name='All'/> All "
+                "(Note: Historical addresses are in red text)",
+                "<table id='grdAddress'>"
+                "<tr><th>Select</th><th>Beg Nbr</th><th>End Nbr</th>"
+                "<th>Dir</th><th>Str Name</th><th>Str Type</th></tr>",
+            ]
+            for p_ in parcels:
+                parts = p_["label"].split()
+                beg = parts[0]
+                direction = parts[1] if len(parts) > 3 else ""
+                str_name = parts[2] if direction else parts[1]
+                str_type = parts[-1]
                 boxes.append(
-                    f"<input type='checkbox' id='{p['dom_id']}' name='{p['id']}' "
-                    f"value='{p['label']}'/> {p['label']}<br/>")
+                    f"<tr><td><input type='checkbox' id='{p_['dom_id']}' "
+                    f"name='{p_['id']}' value='{p_['label']}'/></td>"
+                    f"<td>{beg}</td><td></td><td>{direction}</td>"
+                    f"<td>{str_name}</td><td>{str_type}</td></tr>")
+            boxes.append("</table>")
             boxes.append("<input type='submit' name='btnNext2' id='btnNext2' value='Continue'/>")
             action = f"{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
             return self._send(_page("".join(boxes), vs, action), sid, is_new)

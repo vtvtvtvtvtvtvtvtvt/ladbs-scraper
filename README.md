@@ -238,6 +238,15 @@ passes an AIN where an address is expected still gets results.
 timeout **above** this value — otherwise the client aborts a request the
 service was about to answer, and you lose records that were already collected.
 
+**Several address rows per search:** LADBS matches an address against a grid
+of rows that can differ only by direction — "234 Museum Dr" returns both
+`234 MUSEUM DR` and `234 W MUSEUM DR`, each with its own documents. All of them
+are selected, and `diagnostics.parcels` lists exactly which. The same page also
+carries "Display Fields" checkboxes (All Fields, Frac, Unit, Zip Code) and an
+"All" toggle that are **not** addresses; the parcel grid is located by its
+`Select` / `Beg Nbr` / `Str Name` column headings so those controls are never
+submitted as if they were parcels.
+
 **Images:** a row's document link carries a `Hidden`/`Visible` flag, but that
 only says whether the image pane opens expanded — it does **not** say whether
 an image exists. `has_digital_image` is driven by whether a document GUID

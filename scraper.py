@@ -278,19 +278,78 @@ def parse_results_html(html: str) -> list:
     return records
 
 
+# Column headings that identify the parcel-selection grid. The page also
+# carries unrelated "Display Fields" checkboxes (All Fields, Frac, Unit, Zip
+# Code) and an "All" toggle; treating those as parcels means submitting a
+# display option instead of an address.
+PARCEL_HEADERS = ("beg nbr", "str name", "str type", "end nbr")
+
+# Checkbox labels that are page controls, never parcels.
+NON_PARCEL_LABELS = (
+    "all fields", "frac", "unit", "zip code", "all", "checkall", "check all",
+)
+
+
+def find_parcel_table(soup):
+    """The grid of matching addresses, identified by its column headings."""
+    for table in soup.find_all("table"):
+        headings = " ".join(
+            cell.get_text(strip=True).lower()
+            for cell in table.find_all(["th", "td"], limit=12))
+        if "select" in headings and any(h in headings for h in PARCEL_HEADERS):
+            return table
+    return None
+
+
 def parse_checkboxes(html: str) -> list:
-    """Parcel/address selection checkboxes on the intermediate LADBS page."""
+    """The address checkboxes on the LADBS selection page — those only.
+
+    An address can match several rows that differ just by direction: a search
+    for "234 Museum Dr" returns both "234 MUSEUM DR" and "234 W MUSEUM DR",
+    and taking only one silently halves the results.
+    """
     soup = BeautifulSoup(html, "html.parser")
+
+    table = find_parcel_table(soup)
+    if table:
+        pairs = []
+        for row in table.find_all("tr"):
+            cb = row.find("input", {"type": "checkbox"})
+            if not cb or not cb.get("name"):
+                continue
+            cells = [c.get_text(" ", strip=True) for c in row.find_all("td")]
+            label = " ".join(c for c in cells if c) or (cb.get("value") or "")
+            pairs.append({
+                "name": cb.get("name", ""),
+                "value": cb.get("value", "") or "",
+                "id": cb.get("id", "") or "",
+                "label": re.sub(r"\s+", " ", label).strip(),
+            })
+        if pairs:
+            return pairs
+        logger.warning("parcel table found but it held no checkboxes")
+
+    # No recognisable grid: fall back to every checkbox that is not obviously
+    # a page control.
+    logger.warning("no parcel table found; falling back to loose checkbox scan")
     pairs = []
     for cb in soup.find_all("input", {"type": "checkbox"}):
         name = cb.get("name", "") or ""
-        value = cb.get("value", "") or ""
         cb_id = cb.get("id", "") or ""
         if not name:
             continue
-        if "checkall" in name.lower() or "checkall" in cb_id.lower():
+        # Compare on letters only, so "All Fields", "AllFields" and
+        # "all_fields" are all recognised as the same page control.
+        def squash(text):
+            return re.sub(r"[^a-z]", "", (text or "").lower())
+
+        if "checkall" in squash(f"{name}{cb_id}"):
             continue
-        pairs.append({"name": name, "value": value, "id": cb_id})
+        controls = {squash(c) for c in NON_PARCEL_LABELS}
+        if squash(name) in controls or squash(cb_id) in controls:
+            continue
+        pairs.append({"name": name, "value": cb.get("value", "") or "",
+                      "id": cb_id, "label": cb.get("value", "") or name})
     return pairs
 
 
@@ -587,7 +646,8 @@ class LADBSScraper:
 
         checkboxes = parse_checkboxes(html)
         self._diag["checkboxes_found"] = len(checkboxes)
-        self._step(f"selection page has {len(checkboxes)} parcel checkbox(es)")
+        self._step(f"selection page has {len(checkboxes)} address row(s): "
+                   f"{[c.get('label') or c['name'] for c in checkboxes]}")
 
         if not checkboxes:
             self._warn(
@@ -603,7 +663,9 @@ class LADBSScraper:
         # them one at a time means re-running the whole search per parcel,
         # which is what pushed busy addresses past the time budget.
         if len(checkboxes) > 1 and self.parcel_mode == "all":
-            self._step(f"selecting all {len(checkboxes)} parcels in one submit")
+            self._diag["parcels"] = [c.get("label") or c["name"] for c in checkboxes]
+            self._step(f"selecting all {len(checkboxes)} parcels in one submit: "
+                       f"{self._diag['parcels']}")
             if await self._check_all_and_continue(checkboxes):
                 combined_html = await self._page.content()
                 self._capture_markup(combined_html)
@@ -628,7 +690,8 @@ class LADBSScraper:
                 # Re-run the search so each selection starts from a fresh,
                 # server-issued __VIEWSTATE instead of a stale one.
                 await restart()
-            self._step(f"selecting checkbox {idx + 1}/{len(checkboxes)}: {cb['name']}")
+            self._step(f"selecting address {idx + 1}/{len(checkboxes)}: "
+                       f"{cb.get('label') or cb['name']}")
             if not await self._check_and_continue(cb):
                 continue
             parcel_html = await self._page.content()
