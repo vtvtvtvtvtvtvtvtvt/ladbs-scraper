@@ -225,6 +225,8 @@ the same lines are written to the Railway logs.
 | `checkboxes_found: 0` on a real parcel | The first search step didn't match — check `parsed_address` / `parsed_ain` in the diagnostics. |
 | `detail_error: Session expired` | The detail page was requested outside the search session. |
 | `status: "blocked"` | Upstream served a block or error page. `page_snapshot.visible_text` quotes it. |
+| `image_row_sample` present | A row showed an image icon but yielded no document id; the row's markup is captured automatically. Send it on — it is what the image parser needs. |
+| `address_grid_sample` present | The search offered one address row or none, so the grid markup is kept for inspection. |
 | `rows_showing_image_icon` > `records_with_image` | Rows show an image icon but no document id could be extracted — the image parser is missing a link shape. Re-run with `"debug": true` and inspect `grid_html_sample`. |
 | `result_pages` < `pages_advertised` | Not every result page was read; the response is marked `truncated`. |
 | `status: "partial"` | The time budget ran out. Raise `SCRAPE_TIMEOUT_SECONDS` or pass `include_details: false`. |

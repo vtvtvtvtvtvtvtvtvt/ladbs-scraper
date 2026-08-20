@@ -301,6 +301,25 @@ def find_parcel_table(soup):
     return None
 
 
+def unresolved_image_row(html: str):
+    """The first result row showing an image icon that yields no document id.
+
+    When the icon count outruns the extracted ids, this is the markup that
+    explains why — captured automatically so the gap does not need a
+    reproduction to diagnose.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    grid = soup.find("table", id="grdIdisResult")
+    if not grid:
+        return None
+    for row in grid.find_all("tr"):
+        if row.find("th"):
+            continue
+        if row_has_image_icon(row) and not row_image_guids(row, ""):
+            return str(row)[:2500]
+    return None
+
+
 def parse_checkboxes(html: str) -> list:
     """The address checkboxes on the LADBS selection page — those only.
 
@@ -522,19 +541,39 @@ class LADBSScraper:
                 self._page = None
                 self._context = None
 
+    @staticmethod
+    def _address_grid_sample(html):
+        soup = BeautifulSoup(html, "html.parser")
+        table = find_parcel_table(soup)
+        if table:
+            return str(table)[:2500]
+        # No recognisable grid: keep the checkboxes and their surroundings.
+        boxes = soup.find_all("input", {"type": "checkbox"})
+        return " ".join(str(b.parent)[:300] for b in boxes[:8])[:2500] or None
+
     def _capture_markup(self, html):
-        """Stash the raw grid and pager markup when running in debug mode."""
+        """Keep the markup behind any result that does not add up."""
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Always keep the pager: it is small, and page counts are the thing
+        # most often disputed.
+        nav = soup.find(id="pnlNavigate")
+        if nav and "pager_html" not in self._diag:
+            self._diag["pager_html"] = str(nav)[:1500]
+
+        # Always keep one row that shows an icon but yields no document id.
+        if "image_row_sample" not in self._diag:
+            sample = unresolved_image_row(html)
+            if sample:
+                self._diag["image_row_sample"] = sample
+
         if not self.debug or "grid_html_sample" in self._diag:
             return
-        soup = BeautifulSoup(html, "html.parser")
         grid = soup.find(id="grdIdisResult")
         if grid:
             rows = grid.find_all("tr")
             self._diag["grid_html_sample"] = "".join(str(r) for r in rows[:6])[:6000]
             self._diag["grid_row_count"] = len(rows)
-        nav = soup.find(id="pnlNavigate")
-        self._diag["pager_html"] = str(nav)[:2000] if nav else None
-
     async def _snapshot(self) -> dict:
         """Describe the page the scrape ended on.
 
@@ -716,6 +755,12 @@ class LADBSScraper:
 
         checkboxes = parse_checkboxes(html)
         self._diag["checkboxes_found"] = len(checkboxes)
+        # Recorded here so it is reported whatever parcel_mode is in use.
+        self._diag["parcels"] = [c.get("label") or c["name"] for c in checkboxes]
+        if len(checkboxes) <= 1:
+            # Fewer rows than a search usually offers: keep the grid markup so
+            # a missing address row can be seen rather than inferred.
+            self._diag["address_grid_sample"] = self._address_grid_sample(html)
         self._step(f"selection page has {len(checkboxes)} address row(s): "
                    f"{[c.get('label') or c['name'] for c in checkboxes]}")
 
@@ -733,7 +778,6 @@ class LADBSScraper:
         # them one at a time means re-running the whole search per parcel,
         # which is what pushed busy addresses past the time budget.
         if len(checkboxes) > 1 and self.parcel_mode == "all":
-            self._diag["parcels"] = [c.get("label") or c["name"] for c in checkboxes]
             self._step(f"selecting all {len(checkboxes)} parcels in one submit: "
                        f"{self._diag['parcels']}")
             if await self._check_all_and_continue(checkboxes):

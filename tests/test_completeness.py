@@ -229,3 +229,55 @@ class TestParcelTableDetection:
             <input type="checkbox" name="chkAddress$0" value="234 MUSEUM DR"/>
         </body></html>"""
         assert [c["name"] for c in parse_checkboxes(html)] == ["chkAddress$0"]
+
+
+class TestDiagnosticsAreReportedInEveryMode:
+    """The caller ran parcel_mode="each" and got empty address_rows."""
+
+    def test_parcels_recorded_when_walking_rows_one_at_a_time(self):
+        result = scrape_address(MUSEUM_ADDRESS, parcel_mode="each")
+        assert result["diagnostics"]["parcels"] == ["234 MUSEUM DR", "234 W MUSEUM DR"]
+
+    def test_parcels_recorded_in_combined_mode(self, museum):
+        assert museum["diagnostics"]["parcels"] == ["234 MUSEUM DR", "234 W MUSEUM DR"]
+
+    def test_pager_markup_is_kept_without_asking(self, windowed):
+        # Page counts are the most-disputed number; keep the evidence.
+        assert "pnlNavigate" in windowed["diagnostics"]["pager_html"]
+
+    def test_a_lone_address_row_keeps_the_grid_markup(self):
+        # One row where a search usually offers several is worth seeing.
+        diag = scrape(PAGER_AIN)["diagnostics"]
+        assert diag["checkboxes_found"] == 1
+        assert diag["address_grid_sample"]
+
+
+class TestUnresolvedImageEvidence:
+    """When icons outnumber extracted ids, keep the row that explains it."""
+
+    def _grid(self, row_html):
+        return f"<table id='grdIdisResult'><tr><th>h</th></tr>{row_html}</table>"
+
+    def test_captures_a_row_whose_icon_has_no_document_id(self):
+        from scraper import unresolved_image_row
+        row = ("<tr><td><a href=\"javascript:ShowImg(3)\">"
+               "<img src='/i/camera.gif' alt='Digital Image'/></a></td>"
+               "<td><a href=\"javascript:OpenWindow('1','Hidden','')\">P</a></td>"
+               "</tr>")
+        found = unresolved_image_row(self._grid(row))
+        assert found and "camera.gif" in found
+
+    def test_ignores_rows_whose_icon_resolves(self):
+        from scraper import unresolved_image_row
+        row = ("<tr><td><a href=\"javascript:OpenImage("
+               "'{11111111-2222-3333-4444-555555555555}')\">"
+               "<img src='camera.gif'/></a></td></tr>")
+        assert unresolved_image_row(self._grid(row)) is None
+
+    def test_ignores_rows_with_no_icon(self):
+        from scraper import unresolved_image_row
+        assert unresolved_image_row(self._grid("<tr><td>plain</td></tr>")) is None
+
+    def test_no_grid_is_safe(self):
+        from scraper import unresolved_image_row
+        assert unresolved_image_row("<html><body>nothing</body></html>") is None
