@@ -16,7 +16,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 NAV_TIMEOUT = 30000
-SETTLE_SECONDS = 1.5
+SETTLE_SECONDS = float(os.environ.get("LADBS_SETTLE_SECONDS", "1.5"))
 MAX_RESULT_PAGES = 25
 
 # A scrape must always answer, even on a parcel with hundreds of documents.
@@ -248,8 +248,12 @@ class LADBSScraper:
     those tokens out-of-band is what made earlier versions fail intermittently.
     """
 
-    def __init__(self, headless: bool = True, budget_seconds: float = None):
+    def __init__(self, headless: bool = True, budget_seconds: float = None,
+                 parcel_mode: str = "all"):
         self.headless = headless
+        # "all": one submit covering every matched parcel (fast).
+        # "each": one search per parcel — the old behaviour, kept as a fallback.
+        self.parcel_mode = parcel_mode if parcel_mode in ("all", "each") else "all"
         self.budget_seconds = (
             SCRAPE_BUDGET_SECONDS if budget_seconds is None else budget_seconds)
         self._page = None
@@ -381,7 +385,9 @@ class LADBSScraper:
         logger.warning(msg)
         self._diag["warnings"].append(msg)
 
-    async def _goto(self, url, settle: float = SETTLE_SECONDS):
+    async def _goto(self, url, settle: float = None):
+        """settle=None means the module default, so it stays tunable at runtime."""
+        settle = SETTLE_SECONDS if settle is None else settle
         self._step(f"goto {url}")
         timeout = max(5000, min(NAV_TIMEOUT, int(self._time_left() * 1000)))
         try:
@@ -519,6 +525,26 @@ class LADBSScraper:
             self._diag["final_html_len"] = len(html)
             return []
 
+        # An address can match many assessor parcels — 24 is a real case. Ask
+        # for all of them in one submit; the selection page is a plain
+        # multi-select, and its CheckAll box exists precisely for this. Walking
+        # them one at a time means re-running the whole search per parcel,
+        # which is what pushed busy addresses past the time budget.
+        if len(checkboxes) > 1 and self.parcel_mode == "all":
+            self._step(f"selecting all {len(checkboxes)} parcels in one submit")
+            if await self._check_all_and_continue(checkboxes):
+                records = parse_results_html(await self._page.content())
+                records += await self._paginate()
+                if records:
+                    self._diag["parcel_mode"] = "all"
+                    self._diag["parcels_selected"] = len(checkboxes)
+                    self._step(f"combined selection yielded {len(records)} record(s)")
+                    return self._dedupe(records)
+            self._warn("selecting all parcels returned nothing; falling back to "
+                       "one parcel at a time")
+            await restart()
+
+        self._diag["parcel_mode"] = "each"
         all_records = []
         for idx, cb in enumerate(checkboxes):
             if self._out_of_time(
@@ -538,7 +564,19 @@ class LADBSScraper:
 
         return self._dedupe(all_records)
 
-    async def _check_and_continue(self, cb):
+    async def _check_all_and_continue(self, checkboxes):
+        """Tick every parcel box, then submit once."""
+        checked = 0
+        for cb in checkboxes:
+            if await self._check_box(cb):
+                checked += 1
+        if not checked:
+            self._warn("could not tick any parcel checkbox")
+            return False
+        self._step(f"ticked {checked}/{len(checkboxes)} parcel checkbox(es)")
+        return await self._continue_to_documents()
+
+    async def _check_box(self, cb) -> bool:
         selectors = []
         if cb.get("id"):
             selectors.append(f'input[type="checkbox"][id="{cb["id"]}"]')
@@ -546,22 +584,18 @@ class LADBSScraper:
             selectors.append(
                 f'input[type="checkbox"][name="{cb["name"]}"][value="{cb["value"]}"]')
         selectors.append(f'input[type="checkbox"][name="{cb["name"]}"]')
-
-        checked = False
         for sel in selectors:
             try:
                 loc = self._page.locator(sel).first
                 if await loc.count() == 0:
                     continue
                 await loc.check(timeout=5000)
-                checked = True
-                break
+                return True
             except Exception as e:
                 self._warn(f"check {cb['name']} via {sel} failed: {e}")
-        if not checked:
-            self._warn(f"could not check checkbox {cb['name']}")
-            return False
+        return False
 
+    async def _continue_to_documents(self):
         return await self._click_first(
             ["input[name='btnNext2']",
              "input[id='btnNext2']",
@@ -569,6 +603,12 @@ class LADBSScraper:
              "input[name='btnSearch']",
              "input[type='submit']"],
             "continue to documents")
+
+    async def _check_and_continue(self, cb):
+        if not await self._check_box(cb):
+            self._warn(f"could not check checkbox {cb['name']}")
+            return False
+        return await self._continue_to_documents()
 
     async def _paginate(self):
         """Click through the numbered result pages, if any."""

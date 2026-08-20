@@ -9,7 +9,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional
 from scraper import LADBSScraper
 from playwright.async_api import async_playwright
@@ -29,12 +29,23 @@ app.add_middleware(
 )
 
 class ScrapeRequest(BaseModel):
+    # Reject unknown fields. A misspelled or unsupported option that is quietly
+    # accepted and ignored is worse than an error: the caller believes it took
+    # effect and measures the wrong thing.
+    model_config = ConfigDict(extra="forbid")
+
     address: Optional[str] = None
     ain: Optional[str] = None
-    # Detail pages are the bulk of a scrape's runtime and add only fields like
-    # status/applicant. Callers that render the grid columns (type, sub-type,
-    # date, number, image link) can set this false and get results in seconds.
+    # Detail pages add only fields like status/applicant. Callers that render
+    # the grid columns (type, sub-type, date, number, image link) can turn
+    # them off.
     include_details: bool = True
+    # Overrides SCRAPE_TIMEOUT_SECONDS for this request, so a caller that can
+    # afford to wait longer does not need the service redeployed.
+    time_budget_seconds: Optional[float] = Field(default=None, ge=10, le=900)
+    # "all" submits every matched parcel at once; "each" walks them one at a
+    # time (slower, kept as a fallback).
+    parcel_mode: str = Field(default="all", pattern="^(all|each)$")
 
 @app.get("/health")
 def health():
@@ -64,7 +75,10 @@ def _log_if_empty(result: dict, identifier: str):
 
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
-    scraper = LADBSScraper()
+    scraper = LADBSScraper(
+        budget_seconds=request.time_budget_seconds,
+        parcel_mode=request.parcel_mode,
+    )
 
     # Prefer AIN over address if both provided
     if request.ain:

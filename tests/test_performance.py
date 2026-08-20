@@ -102,3 +102,44 @@ class TestUpstreamBlock:
 
     def test_successful_scrape_is_ok(self):
         assert scrape("ain", "5443-016-018")["status"] == "ok"
+
+
+class TestRequestOptions:
+    """Options must take effect or be rejected — never silently ignored."""
+
+    def _post(self, payload):
+        from fastapi.testclient import TestClient
+        import main
+        with MockLADBS() as mock:
+            old = scraper_mod.BASE_URL, scraper_mod.MAIN_URL
+            scraper_mod.BASE_URL = f"{mock.base}{IDIS}"
+            scraper_mod.MAIN_URL = mock.base
+            try:
+                return TestClient(main.app).post("/scrape", json=payload)
+            finally:
+                scraper_mod.BASE_URL, scraper_mod.MAIN_URL = old
+
+    def test_time_budget_is_honoured(self):
+        body = self._post({"ain": "5443-016-018", "time_budget_seconds": 45}).json()
+        assert body["diagnostics"]["time_budget_seconds"] == 45.0
+
+    def test_unknown_option_is_rejected_not_ignored(self):
+        # Previously any unrecognised key was accepted and quietly dropped.
+        for bad in ("budget_seconds", "timeout_seconds", "max_seconds"):
+            resp = self._post({"ain": "5443-016-018", bad: 300})
+            assert resp.status_code == 422, f"{bad} was silently accepted"
+
+    def test_budget_out_of_range_is_rejected(self):
+        assert self._post({"ain": "5443-016-018", "time_budget_seconds": 5}).status_code == 422
+        assert self._post({"ain": "5443-016-018", "time_budget_seconds": 5000}).status_code == 422
+
+    def test_parcel_mode_is_validated(self):
+        assert self._post({"ain": "5443-016-018", "parcel_mode": "nonsense"}).status_code == 422
+        assert self._post({"ain": "5443-016-018", "parcel_mode": "each"}).status_code == 200
+
+    def test_diagnostics_is_a_json_object_not_a_string(self):
+        # It string-coerced to "[object Object]" on the caller's side.
+        diag = self._post({"ain": "1111-222-333"}).json()["diagnostics"]
+        assert isinstance(diag, dict)
+        assert isinstance(diag["page_snapshot"], dict)
+        assert isinstance(diag["page_snapshot"]["form_fields"], list)

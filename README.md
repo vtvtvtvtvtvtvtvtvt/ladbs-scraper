@@ -38,9 +38,22 @@ Returns `{"status": "ok"}` — use to confirm the service is running.
 {
   "address": "2100 Cypress Ave, Los Angeles, CA 90065",
   "ain": "5467018015",
-  "include_details": true
+  "include_details": true,
+  "time_budget_seconds": 150,
+  "parcel_mode": "all"
 }
 ```
+
+Unknown fields are **rejected with a 422**, not ignored — an option that is
+silently dropped makes a caller believe it took effect.
+
+`time_budget_seconds` (10–900) overrides `SCRAPE_TIMEOUT_SECONDS` for one
+request, so a caller who can wait longer does not need the service redeployed.
+
+`parcel_mode` (`all` by default) decides how a multi-parcel address is handled.
+An LA address can match a couple of dozen assessor parcels: `all` ticks every
+parcel and submits once, `each` walks them one at a time — one full search per
+parcel, which is far slower and exists only as a fallback.
 
 Send `address` **or** `ain` (`ain` wins if both are present). An `address` that
 is really a parcel number is detected and routed to the AIN search.
@@ -217,6 +230,11 @@ passes an AIN where an address is expected still gets results.
 150) and returns what it has with `status: "partial"`. Keep your client's own
 timeout **above** this value — otherwise the client aborts a request the
 service was about to answer, and you lose records that were already collected.
+
+**Parcel fan-out:** an address matching many parcels used to mean one complete
+search per parcel, which is what pushed busy addresses past the budget.
+Searching by AIN avoids the fan-out entirely by resolving to a single parcel,
+so pass `ain` whenever you have one.
 
 **Concurrency:** detail pages are fetched `LADBS_DETAIL_CONCURRENCY` at a time
 (default 6) through one browser context, which shares the session cookie. Raise

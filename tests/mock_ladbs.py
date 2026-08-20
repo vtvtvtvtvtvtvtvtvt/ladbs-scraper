@@ -43,6 +43,20 @@ RECORDS[BULK_LABEL] = {
         for i in range(60)]
 }
 
+# An address that matches many assessor parcels — the 6801 Hollywood case.
+FAN_PARCELS = [
+    {"id": f"chkAddress${i}", "dom_id": f"chkAddress_{i}",
+     "label": f"{6801 + i} FANOUT BLVD"}
+    for i in range(24)
+]
+for _p in FAN_PARCELS:
+    _n = int(_p["label"].split()[0]) - 6801
+    RECORDS[_p["label"]] = {
+        1: [(f"{7000 + _n * 10 + j}", "Building Permit", "Alteration",
+             "05/05/2005", f"05010-10000-{_n:02d}{j}", "")
+            for j in range(5)]
+    }
+
 _counter = itertools.count(1)
 
 
@@ -53,6 +67,7 @@ class _State:
         self.hits = []              # request log
         self.searched = set()       # sids that actually ran a document search
         self.detail_delay = 0.0     # simulate real per-request network latency
+        self.searches = 0           # how many times the search form was loaded
 
 
 STATE = _State()
@@ -75,8 +90,21 @@ def _expired():
             "<p>Please start your search again.</p></body></html>")
 
 
-def _results_page(label, page_no, viewstate):
-    pages = RECORDS.get(label, {})
+def _pages_for(labels):
+    """One parcel keeps its own paging; several are merged and re-paged."""
+    if len(labels) == 1:
+        return RECORDS.get(labels[0], {})
+    merged = [r for label in labels
+              for pg in sorted(RECORDS.get(label, {}))
+              for r in RECORDS[label][pg]]
+    chunks = [merged[i:i + 25] for i in range(0, len(merged), 25)]
+    return {i + 1: chunk for i, chunk in enumerate(chunks)}
+
+
+def _results_page(labels, page_no, viewstate):
+    if isinstance(labels, str):
+        labels = [labels]
+    pages = _pages_for(labels)
     rows = ["<tr><th>#</th><th>Document Type</th><th>Sub Type</th>"
             "<th>Date</th><th>Number</th></tr>"]
     for i, (rid, dtype, sub, date, num, guid) in enumerate(pages.get(page_no, [])):
@@ -102,8 +130,9 @@ def _results_page(label, page_no, viewstate):
             f"<form id='pg{p}' method='post' action='{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ASSR'>"
             f"<input type='hidden' name='__VIEWSTATE' value='{viewstate}'/>"
             f"<input type='hidden' name='PageNo' value='{p}'/>"
-            f"<input type='hidden' name='SelectedLabel' value='{label}'/>"
-            f"</form>"
+            + "".join(f"<input type='hidden' name='SelectedLabel' value='{lb}'/>"
+                      for lb in labels)
+            + "</form>"
             for p in sorted(pages) if p != page_no)
         nav = f"<div id='pnlNavigate'>{''.join(links)}</div>{forms}"
 
@@ -157,6 +186,7 @@ class Handler(BaseHTTPRequestHandler):
         vs = self._issue_viewstate(sid)
 
         if url.path.endswith("/ParcelSearch.aspx"):
+            STATE.searches += 1
             search_type = (qs.get("SearchType") or [""])[0]
             if search_type == "PRCL_ASMT":
                 body = ("Book <input type='text' name='Assessor$txtAssessorNoBook' "
@@ -225,6 +255,8 @@ class Handler(BaseHTTPRequestHandler):
                        one("Assessor$txtAssessorNoParcel"))
                 if ain == ("9999", "999", "999"):        # high-history parcel
                     ok, parcels = True, BULK_PARCELS
+                elif ain == ("7777", "777", "777"):      # 24-parcel address
+                    ok, parcels = True, FAN_PARCELS
                 elif ain == ("4030", "030", "030"):      # upstream refuses us
                     return self._send(
                         "<html><head><title>Access Denied</title></head><body>"
@@ -233,8 +265,12 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     ok = ain == ("5443", "016", "018")
             else:
-                ok = (one("Address$txtAddressBegNo") == "2100"
-                      and one("Address$txtAddressStreetName").upper() == "CYPRESS")
+                street = one("Address$txtAddressStreetName").upper()
+                if street == "FANOUT":
+                    ok, parcels = True, FAN_PARCELS
+                else:
+                    ok = (one("Address$txtAddressBegNo") == "2100"
+                          and street == "CYPRESS")
             if not ok:
                 return self._send(
                     "<html><body>No parcels matched your search.</body></html>", sid, is_new)
@@ -256,13 +292,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(
                     "<html><body>Please select a parcel.</body></html>", sid, is_new)
             STATE.searched.add(sid)
-            return self._send(_results_page(selected[0], 1, vs), sid, is_new)
+            return self._send(_results_page(selected, 1, vs), sid, is_new)
 
         # Pagination postback
         if "PageNo" in form:
             STATE.searched.add(sid)
             return self._send(
-                _results_page(one("SelectedLabel"), int(one("PageNo", "1")), vs), sid, is_new)
+                _results_page(form.get("SelectedLabel", []),
+                              int(one("PageNo", "1")), vs), sid, is_new)
 
         return self._send("<html><body>Unhandled post</body></html>", sid, is_new)
 
@@ -281,6 +318,7 @@ class MockLADBS:
         STATE.sessions.clear()
         STATE.hits.clear()
         STATE.searched.clear()
+        STATE.searches = 0
         STATE.stale_rejections = 0
         self.thread.start()
         return self
