@@ -177,6 +177,15 @@ the same lines are written to the Railway logs.
 | `detail_error: Session expired` | The detail page was requested outside the search session. |
 | Empty records but no warnings | The parcel genuinely has no IDIS documents. |
 
+**LADBS only covers the City of Los Angeles.** Pasadena, Glendale, Burbank,
+Santa Monica and the rest of LA County run their own building departments, so
+IDIS will never return anything for those addresses. When the address names one
+of them, the summary says so instead of just reporting nothing found.
+
+**AIN in the address field:** `POST /scrape` with `{"address": "5467018015"}`
+is detected as a parcel number and routed to the AIN search, so a caller that
+passes an AIN where an address is expected still gets results.
+
 **Address parsing:** LADBS wants the bare street name. `parse_address` strips
 the house number, a directional prefix and the street-type suffix, so
 `1234 S San Fernando Rd` is searched as number `1234`, direction `S`, street

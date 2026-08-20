@@ -30,6 +30,51 @@ STREET_SUFFIXES = {
 }
 UNIT_MARKERS = {"UNIT", "APT", "STE", "SUITE", "#", "NO"}
 
+# LADBS holds records for the City of Los Angeles only. These LA County cities
+# run their own building departments, so IDIS will never have anything for them.
+OTHER_JURISDICTIONS = {
+    "PASADENA", "SOUTH PASADENA", "GLENDALE", "BURBANK", "SANTA MONICA",
+    "BEVERLY HILLS", "WEST HOLLYWOOD", "CULVER CITY", "INGLEWOOD", "TORRANCE",
+    "LONG BEACH", "ALHAMBRA", "SAN MARINO", "EL SEGUNDO", "MANHATTAN BEACH",
+    "HERMOSA BEACH", "REDONDO BEACH", "GARDENA", "HAWTHORNE", "COMPTON",
+    "CARSON", "VERNON", "COMMERCE", "MONTEBELLO", "MONTEREY PARK",
+    "SAN FERNANDO", "CALABASAS", "AGOURA HILLS", "MALIBU", "SANTA CLARITA",
+    "POMONA", "DOWNEY", "NORWALK", "WHITTIER", "LAKEWOOD", "BELLFLOWER",
+    "PARAMOUNT", "LYNWOOD", "SOUTH GATE", "HUNTINGTON PARK", "MAYWOOD",
+    "BELL", "BELL GARDENS", "CUDAHY", "GLENDORA", "ARCADIA", "SIERRA MADRE",
+    "TEMPLE CITY", "ROSEMEAD", "SAN GABRIEL", "DUARTE", "MONROVIA", "AZUSA",
+    "COVINA", "WEST COVINA", "BALDWIN PARK", "EL MONTE", "SOUTH EL MONTE",
+    "PICO RIVERA", "SANTA FE SPRINGS", "LA MIRADA", "CERRITOS", "ARTESIA",
+    "SIGNAL HILL", "LAWNDALE", "LOMITA", "PALOS VERDES ESTATES",
+    "RANCHO PALOS VERDES", "ROLLING HILLS", "WALNUT", "DIAMOND BAR",
+    "LA VERNE", "SAN DIMAS", "CLAREMONT", "IRWINDALE", "INDUSTRY",
+    "PICO RIVERA", "HIDDEN HILLS", "WESTLAKE VILLAGE",
+}
+
+
+def looks_like_ain(value: str) -> bool:
+    """True for '5467018015' or '5467-018-015' — an AIN sent in the address slot.
+
+    Callers (the CRM among them) sometimes pass a parcel number where an
+    address is expected; treating it as a street address searches for nothing.
+    """
+    if not value or re.search(r"[A-Za-z]", value):
+        return False
+    return len(re.sub(r"[^0-9]", "", value)) == 10
+
+
+def detect_other_jurisdiction(address: str) -> str:
+    """Name the city if the address is plainly outside the City of Los Angeles.
+
+    Only the parts after the street line are examined, so a street called
+    "San Fernando Road" is not mistaken for the City of San Fernando.
+    """
+    parts = [p.strip().upper() for p in (address or "").split(",")[1:]]
+    for part in parts:
+        if part in OTHER_JURISDICTIONS:
+            return part.title()
+    return ""
+
 
 def parse_address(raw: str):
     """Split a street address into (house_number, street_name, direction).
@@ -190,7 +235,15 @@ class LADBSScraper:
     # ---------------- public API ----------------
 
     async def scrape(self, address: str) -> dict:
-        """Search by street address."""
+        """Search by street address (or by AIN, if that is what was passed)."""
+        if looks_like_ain(address):
+            logger.info(f"{address!r} is an AIN, not an address — searching by AIN")
+            result = await self.scrape_by_ain(address)
+            result["address"] = address
+            result["diagnostics"]["routed"] = (
+                "value looked like an AIN, so the AIN search was used")
+            return result
+
         number, street_name, direction = parse_address(address)
         logger.info(f"Parsed: number={number} street={street_name!r} dir={direction!r}")
 
@@ -198,6 +251,10 @@ class LADBSScraper:
             self._diag["parsed_address"] = {
                 "number": number, "street": street_name, "direction": direction,
             }
+            outside = detect_other_jurisdiction(address)
+            if outside:
+                self._diag["outside_jurisdiction"] = outside
+                self._warn(f"{outside} is not covered by LADBS (City of LA only)")
             records = await self._collect_records(
                 lambda: self._start_address_search(number, street_name, direction)
             )
@@ -476,12 +533,19 @@ class LADBSScraper:
     async def _finish(self, records, key, key_value, identifier):
         self._step(f"total unique records: {len(records)}")
         if not records:
+            summary = f"No records found for {identifier}."
+            outside = self._diag.get("outside_jurisdiction")
+            if outside:
+                summary += (
+                    f" {outside} is outside the City of Los Angeles, and LADBS"
+                    f" only holds records for properties inside the city — check"
+                    f" the {outside} building department instead.")
             return {
                 key: key_value,
                 "total_records": 0,
                 "records": [],
                 "attachments": [],
-                "summary": f"No records found for {identifier}.",
+                "summary": summary,
                 "diagnostics": self._diag,
             }
 

@@ -100,3 +100,21 @@ class TestNoMatch:
         result = run_scrape("address", "9999 Nowhere St, Los Angeles")
         assert result["total_records"] == 0
         assert result["diagnostics"]["checkboxes_found"] == 0
+
+
+class TestCrmInputs:
+    """The exact values found in the CRM's property_research table."""
+
+    def test_bare_ain_in_the_address_field_still_searches(self):
+        # Row 14 sent "5467018015" as the address; the AIN search must kick in.
+        result = run_scrape("address", "5443016018")
+        assert result["total_records"] == 4
+        assert result["address"] == "5443016018"
+        assert result["ain"] == "5443016018"
+        assert "AIN" in result["diagnostics"]["routed"]
+
+    def test_out_of_area_address_explains_itself(self):
+        result = run_scrape("address", "1975 Lincoln Ave, Pasadena, CA, USA")
+        assert result["total_records"] == 0
+        assert result["diagnostics"]["outside_jurisdiction"] == "Pasadena"
+        assert "outside the City of Los Angeles" in result["summary"]

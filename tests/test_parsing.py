@@ -151,3 +151,55 @@ class TestDedupe:
         recs = [{"record_id": "1"}, {"record_id": "2"}, {"record_id": "1"}]
         out = LADBSScraper._dedupe(recs)
         assert [r["record_id"] for r in out] == ["1", "2"]
+
+
+class TestAinInAddressSlot:
+    """The CRM sometimes puts a parcel number in the address field."""
+
+    @pytest.mark.parametrize("value", [
+        "5467018015",      # exactly what property_research row 14 sent
+        "5638018032",
+        "5467-018-015",
+        " 5467 018 015 ",
+    ])
+    def test_recognised_as_ain(self, value):
+        from scraper import looks_like_ain
+        assert looks_like_ain(value) is True
+
+    @pytest.mark.parametrize("value", [
+        "2100 Cypress Ave", "234 Museum Drive, Los Angeles, CA, USA",
+        "", "12345", "5467018015 Cypress",
+    ])
+    def test_real_addresses_are_not_ains(self, value):
+        from scraper import looks_like_ain
+        assert looks_like_ain(value) is False
+
+    def test_old_parser_would_have_searched_for_nothing(self):
+        # parse_address on a bare AIN yields no street name at all.
+        with pytest.raises(ValueError):
+            parse_address("5467018015")
+
+
+class TestJurisdiction:
+    @pytest.mark.parametrize("address,expected", [
+        ("1975 Lincoln Ave, Pasadena, CA, USA", "Pasadena"),
+        ("5426 San Fernando Road, Glendale, CA, USA", "Glendale"),
+        ("123 Main St, Burbank, CA", "Burbank"),
+    ])
+    def test_flags_other_cities(self, address, expected):
+        from scraper import detect_other_jurisdiction
+        assert detect_other_jurisdiction(address) == expected
+
+    @pytest.mark.parametrize("address", [
+        "234 Museum Drive, Los Angeles, CA, USA",
+        "2100 Cypress Ave",
+        "14500 Ventura Blvd, Sherman Oaks, CA",
+    ])
+    def test_la_city_addresses_are_not_flagged(self, address):
+        from scraper import detect_other_jurisdiction
+        assert detect_other_jurisdiction(address) == ""
+
+    def test_street_name_is_not_mistaken_for_a_city(self):
+        # "San Fernando Road" is a street; the City of San Fernando is not it.
+        from scraper import detect_other_jurisdiction
+        assert detect_other_jurisdiction("5426 San Fernando Road, Los Angeles, CA") == ""
