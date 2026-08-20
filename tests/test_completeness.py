@@ -22,7 +22,20 @@ from mock_ladbs import MockLADBS, IDIS
 scraper_mod.SETTLE_SECONDS = 0.05
 
 PAGER_AIN = "5468-018-015"    # one address, 5 pages behind a 3-wide pager
-MUSEUM_AIN = "5467-018-015"   # two address rows: "234 MUSEUM DR" and "234 W MUSEUM DR"
+# The address search returns both rows; the assessor search reaches only one.
+MUSEUM_ADDRESS = "234 Museum Drive, Los Angeles, CA, USA"
+
+
+def scrape_address(value, **kwargs):
+    with MockLADBS() as mock:
+        old = scraper_mod.BASE_URL, scraper_mod.MAIN_URL
+        scraper_mod.BASE_URL = f"{mock.base}{IDIS}"
+        scraper_mod.MAIN_URL = mock.base
+        try:
+            return asyncio.run(LADBSScraper(**kwargs).scrape(
+                value, include_details=False))
+        finally:
+            scraper_mod.BASE_URL, scraper_mod.MAIN_URL = old
 
 
 def scrape(value, **kwargs):
@@ -44,7 +57,7 @@ def windowed():
 
 @pytest.fixture(scope="module")
 def museum():
-    return scrape(MUSEUM_AIN)
+    return scrape_address(MUSEUM_ADDRESS)
 
 
 class TestWindowedPager:

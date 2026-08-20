@@ -84,31 +84,27 @@ async def scrape(request: ScrapeRequest):
         debug=request.debug,
     )
 
-    # Prefer AIN over address if both provided
-    if request.ain:
-        logger.info(f"Scrape request by AIN: {request.ain}")
-        try:
-            result = await scraper.scrape_by_ain(
-                request.ain, include_details=request.include_details)
-            _log_if_empty(result, f"AIN {request.ain}")
-            return result
-        except Exception as e:
-            logger.error(f"AIN scrape failed: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    elif request.address:
-        logger.info(f"Scrape request by address: {request.address}")
-        try:
-            result = await scraper.scrape(
-                request.address, include_details=request.include_details)
-            _log_if_empty(result, request.address)
-            return result
-        except Exception as e:
-            logger.error(f"Address scrape failed: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    else:
+    if not request.ain and not request.address:
         raise HTTPException(status_code=400, detail="Either 'address' or 'ain' is required")
+
+    identifier = " / ".join(x for x in (request.ain, request.address) if x)
+    logger.info(f"Scrape request: {identifier}")
+    try:
+        # Both identifiers are used when both are given. An AIN alone reaches
+        # one assessor parcel; the address search reaches every address row
+        # LADBS holds for the property, and they are not the same set.
+        result = await scraper.scrape_all(
+            ain=request.ain,
+            address=request.address,
+            include_details=request.include_details,
+        )
+        _log_if_empty(result, identifier)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Scrape failed for {identifier}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/fetch-image")
 async def fetch_image(url: str = Query(...)):

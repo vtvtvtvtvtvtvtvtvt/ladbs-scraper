@@ -306,8 +306,10 @@ class Handler(BaseHTTPRequestHandler):
                        one("Assessor$txtAssessorNoParcel"))
                 if ain == ("9999", "999", "999"):        # high-history parcel
                     ok, parcels = True, BULK_PARCELS
-                elif ain == ("5467", "018", "015"):      # two address rows
-                    ok, parcels = True, WINDOW_PARCELS
+                elif ain == ("5467", "018", "015"):
+                    # Like the real site: the assessor lookup surfaces only
+                    # the directional address row, not its sibling.
+                    ok, parcels = True, WINDOW_PARCELS[1:]
                 elif ain == ("5468", "018", "015"):      # 5 pages, windowed pager
                     ok, parcels = True, PAGER_PARCELS
                 elif ain == ("7777", "777", "777"):      # 24-parcel address
@@ -323,6 +325,9 @@ class Handler(BaseHTTPRequestHandler):
                 street = one("Address$txtAddressStreetName").upper()
                 if street == "FANOUT":
                     ok, parcels = True, FAN_PARCELS
+                elif street == "MUSEUM" and one("Address$txtAddressBegNo") == "234":
+                    # The address search returns every matching row.
+                    ok, parcels = True, WINDOW_PARCELS
                 else:
                     ok = (one("Address$txtAddressBegNo") == "2100"
                           and street == "CYPRESS")

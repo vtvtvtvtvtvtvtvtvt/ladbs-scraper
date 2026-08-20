@@ -410,6 +410,76 @@ class LADBSScraper:
 
         return await self._run(worker)
 
+    async def scrape_all(self, ain: str = None, address: str = None,
+                         include_details: bool = True) -> dict:
+        """Search by every identifier given, in one session, and merge.
+
+        An AIN resolves to one assessor parcel, but LADBS files documents
+        against address records, and a property can hold several that differ
+        only by direction — "234 MUSEUM DR" and "234 W MUSEUM DR". The
+        assessor search surfaces one of them; the address search surfaces all.
+        Running only the AIN, as a caller supplying both would get, silently
+        returns a fraction of the documents.
+        """
+        if not ain and address and looks_like_ain(address):
+            ain, address = address, None
+        if address and looks_like_ain(address):
+            address = None          # same value as the AIN; no second search
+        if not ain and not address:
+            raise ValueError("scrape_all needs an ain or an address")
+
+        async def worker():
+            self._diag["searches"] = []
+            collected = []
+
+            if ain:
+                book, pg, parcel = split_ain(ain)
+                found = await self._collect_records(
+                    lambda: self._start_ain_search(book, pg, parcel))
+                self._note_search("ain", format_ain(ain), found)
+                collected.extend(found)
+
+            if address:
+                try:
+                    number, street_name, direction = parse_address(address)
+                except ValueError as e:
+                    self._warn(f"could not parse address {address!r}: {e}")
+                else:
+                    outside = detect_other_jurisdiction(address)
+                    if outside:
+                        self._diag["outside_jurisdiction"] = outside
+                    found = await self._collect_records(
+                        lambda: self._start_address_search(
+                            number, street_name, direction))
+                    self._note_search("address", address, found)
+                    collected.extend(found)
+
+            merged = self._dedupe(collected)
+            self._step(f"merged {len(collected)} record(s) from "
+                       f"{len(self._diag['searches'])} search(es) -> {len(merged)} unique")
+
+            identifier = " + ".join(
+                s["query"] for s in self._diag["searches"]) or (ain or address)
+            result = await self._finish(
+                merged, "ain" if ain else "address", ain or address,
+                identifier, include_details)
+            if ain:
+                result["ain"] = ain
+            if address:
+                result["address"] = address
+            return result
+
+        return await self._run(worker)
+
+    def _note_search(self, kind, query, records):
+        """Record what one search contributed, so a thin result is traceable."""
+        self._diag["searches"].append({
+            "type": kind,
+            "query": query,
+            "address_rows": self._diag.pop("parcels", []),
+            "records": len(records),
+        })
+
     async def scrape_by_ain(self, ain: str, include_details: bool = True) -> dict:
         """Search by Assessor Identification Number (APN)."""
         book, pg, parcel = split_ain(ain)

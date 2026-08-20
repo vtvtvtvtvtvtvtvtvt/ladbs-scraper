@@ -60,8 +60,14 @@ An LA address can match a couple of dozen assessor parcels: `all` ticks every
 parcel and submits once, `each` walks them one at a time — one full search per
 parcel, which is far slower and exists only as a fallback.
 
-Send `address` **or** `ain` (`ain` wins if both are present). An `address` that
-is really a parcel number is detected and routed to the AIN search.
+Send `address`, `ain`, or **both**. When both are given, both searches run and
+the records are merged and deduplicated — they do not reach the same
+documents. LADBS files documents against address records, and a property can
+hold several that differ only by direction (`234 MUSEUM DR` and
+`234 W MUSEUM DR`); the assessor lookup surfaces one, the address search
+surfaces all of them. `diagnostics.searches` reports what each search ran and
+how many records it contributed. An `address` that is really a parcel number
+is detected and routed to the AIN search rather than searched twice.
 
 `include_details` (default `true`) controls whether the scraper opens the
 detail page for every record. Those pages are the bulk of a scrape's runtime —
@@ -237,6 +243,9 @@ passes an AIN where an address is expected still gets results.
 150) and returns what it has with `status: "partial"`. Keep your client's own
 timeout **above** this value — otherwise the client aborts a request the
 service was about to answer, and you lose records that were already collected.
+
+**AIN vs address:** an AIN alone can return a fraction of a property's
+documents. Send both identifiers whenever you have them.
 
 **Several address rows per search:** LADBS matches an address against a grid
 of rows that can differ only by direction — "234 Museum Dr" returns both
