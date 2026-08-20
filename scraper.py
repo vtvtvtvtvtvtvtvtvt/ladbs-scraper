@@ -153,6 +153,52 @@ def split_ain(ain: str):
     return digits[0:4], digits[4:7], digits[7:10]
 
 
+# Document GUIDs as LADBS writes them: {8-4-4-4-12}, sometimes several per row.
+IMAGE_GUID_RE = re.compile(r"\{[0-9a-fA-F][0-9a-fA-F\-]{7,}\}")
+
+# Attributes anywhere in a row that can carry an image reference.
+LINK_ATTRS = ("href", "onclick", "src", "value", "data-docids")
+
+
+def row_image_guids(row, primary_guid: str) -> list:
+    """Every document GUID referenced anywhere in a result row.
+
+    The document link's OpenWindow() call carries a Hidden/Visible flag, but
+    that only says whether the image pane opens expanded — it does NOT say
+    whether an image exists. Gating on it dropped the image for every row that
+    happened to default to Hidden, which is most of them.
+    """
+    guids = []
+
+    def add(text):
+        for guid in IMAGE_GUID_RE.findall(text or ""):
+            if guid not in guids:
+                guids.append(guid)
+
+    add(primary_guid)
+    for el in row.find_all(True):
+        for attr in LINK_ATTRS:
+            value = el.get(attr)
+            if isinstance(value, str):
+                add(value)
+
+    # A GUID without the usual braces still identifies a document.
+    if not guids and primary_guid and primary_guid.strip():
+        guids.append(primary_guid.strip())
+    return guids
+
+
+def row_has_image_icon(row) -> bool:
+    """Does the row show an image/camera icon, whatever the links say?"""
+    for img in row.find_all("img"):
+        src = (img.get("src") or "").lower()
+        alt = (img.get("alt") or "").lower()
+        if any(w in src or w in alt
+               for w in ("image", "camera", "doc", "pdf", "view", "tif")):
+            return True
+    return False
+
+
 def parse_results_html(html: str) -> list:
     soup = BeautifulSoup(html, "html.parser")
     records = []
@@ -191,9 +237,12 @@ def parse_results_html(html: str) -> list:
         comment_input = row.find("input", id=re.compile(r"hidComments"))
         comments = comment_input.get("value", "") if comment_input else ""
 
+        guids = row_image_guids(row, image_guid)
+        has_icon = row_has_image_icon(row)
         digital_image_url = None
-        if image_visible and image_guid:
-            digital_image_url = f"{BASE_URL}/ImageMain.aspx?DocIds={image_guid}"
+        if guids:
+            digital_image_url = (
+                f"{BASE_URL}/ImageMain.aspx?DocIds={','.join(guids)}")
 
         detail_url = f"{BASE_URL}/Report.aspx?Record_Id={record_id}&Image=Hidden&ImageToOpen="
 
@@ -206,7 +255,12 @@ def parse_results_html(html: str) -> list:
             "comments": comments,
             "detail_url": detail_url,
             "digital_image_url": digital_image_url,
-            "has_digital_image": image_visible,
+            "has_digital_image": bool(guids),
+            # Whether the image pane opens expanded — not whether one exists.
+            "image_pane_visible": image_visible,
+            # An icon with no GUID we could extract means this parser is
+            # missing something; surfaced so it cannot go unnoticed.
+            "image_icon_in_row": has_icon,
             "attachments": [],
         }
 
@@ -218,7 +272,8 @@ def parse_results_html(html: str) -> list:
             })
 
         records.append(record)
-        logger.info(f"  {doc_type} | {sub_type} | {doc_date} | {doc_number} | img={image_visible}")
+        logger.info(f"  {doc_type} | {sub_type} | {doc_date} | {doc_number} | "
+                    f"img={bool(guids)} icon={has_icon}")
 
     return records
 
@@ -249,7 +304,11 @@ class LADBSScraper:
     """
 
     def __init__(self, headless: bool = True, budget_seconds: float = None,
-                 parcel_mode: str = "all"):
+                 parcel_mode: str = "all", debug: bool = False):
+        # debug=True returns the raw results-grid and pager markup in
+        # diagnostics, so a parsing gap can be diagnosed from one call
+        # instead of guessing at the page's structure.
+        self.debug = debug
         self.headless = headless
         # "all": one submit covering every matched parcel (fast).
         # "each": one search per parcel — the old behaviour, kept as a fallback.
@@ -333,6 +392,19 @@ class LADBSScraper:
                 await browser.close()
                 self._page = None
                 self._context = None
+
+    def _capture_markup(self, html):
+        """Stash the raw grid and pager markup when running in debug mode."""
+        if not self.debug or "grid_html_sample" in self._diag:
+            return
+        soup = BeautifulSoup(html, "html.parser")
+        grid = soup.find(id="grdIdisResult")
+        if grid:
+            rows = grid.find_all("tr")
+            self._diag["grid_html_sample"] = "".join(str(r) for r in rows[:6])[:6000]
+            self._diag["grid_row_count"] = len(rows)
+        nav = soup.find(id="pnlNavigate")
+        self._diag["pager_html"] = str(nav)[:2000] if nav else None
 
     async def _snapshot(self) -> dict:
         """Describe the page the scrape ended on.
@@ -533,7 +605,9 @@ class LADBSScraper:
         if len(checkboxes) > 1 and self.parcel_mode == "all":
             self._step(f"selecting all {len(checkboxes)} parcels in one submit")
             if await self._check_all_and_continue(checkboxes):
-                records = parse_results_html(await self._page.content())
+                combined_html = await self._page.content()
+                self._capture_markup(combined_html)
+                records = parse_results_html(combined_html)
                 records += await self._paginate()
                 if records:
                     self._diag["parcel_mode"] = "all"
@@ -557,7 +631,9 @@ class LADBSScraper:
             self._step(f"selecting checkbox {idx + 1}/{len(checkboxes)}: {cb['name']}")
             if not await self._check_and_continue(cb):
                 continue
-            page_records = parse_results_html(await self._page.content())
+            parcel_html = await self._page.content()
+            self._capture_markup(parcel_html)
+            page_records = parse_results_html(parcel_html)
             page_records += await self._paginate()
             self._step(f"  checkbox {idx + 1} yielded {len(page_records)} record(s)")
             all_records.extend(page_records)
@@ -611,35 +687,100 @@ class LADBSScraper:
         return await self._continue_to_documents()
 
     async def _paginate(self):
-        """Click through the numbered result pages, if any."""
+        """Walk every result page, including pagers that show a moving window.
+
+        LADBS shows a few page numbers at a time plus a next/ellipsis control.
+        Following only the numbered links stops at the end of the first window
+        — three pages of five — and, worse, looks like a clean finish.
+        """
         extra = []
         visited = {1}
-        while len(visited) < MAX_RESULT_PAGES:
+        advertised = 1
+
+        for _ in range(MAX_RESULT_PAGES):
             soup = BeautifulSoup(await self._page.content(), "html.parser")
             nav = soup.find(id="pnlNavigate")
             if not nav:
                 break
-            next_page = None
-            for a in nav.find_all("a"):
+
+            advertised = max(advertised, self._pages_advertised(nav))
+            links = nav.find_all("a")
+
+            target = None
+            for a in links:
                 text = a.get_text(strip=True)
                 if text.isdigit() and int(text) not in visited:
-                    next_page = text
+                    target = text
                     break
-            if not next_page:
+            step_label = target
+            if not target:
+                step_label = self._next_control(links)
+                if not step_label:
+                    break
+
+            if self._out_of_time(f"stopped before result page {step_label}"):
                 break
-            if self._out_of_time(f"stopped before result page {next_page}"):
-                break
-            visited.add(int(next_page))
-            self._step(f"  result page {next_page}")
+
+            self._step(f"  result page {step_label}")
             clicked = await self._click_first(
-                [f"#pnlNavigate a:text-is('{next_page}')"],
-                f"result page {next_page}", required=False)
+                [f"#pnlNavigate a:text-is('{step_label}')"],
+                f"result page {step_label}", required=False)
             if not clicked:
-                self._warn(f"could not open result page {next_page}")
+                self._warn(f"could not open result page {step_label}")
                 break
+
+            landed = self._current_page(await self._page.content())
+            if landed is None:
+                landed = int(target) if target and target.isdigit() else max(visited) + 1
+            if landed in visited:
+                self._warn(f"pager did not advance past page {landed}; stopping")
+                break
+            visited.add(landed)
             extra.extend(parse_results_html(await self._page.content()))
+
         self._diag["result_pages"] = max(self._diag["result_pages"], len(visited))
+        self._diag["pages_advertised"] = max(
+            self._diag.get("pages_advertised", 0), advertised)
+        if advertised > len(visited):
+            # Never report a partial read as a clean finish.
+            self._diag["truncated"] = True
+            self._warn(f"read {len(visited)} of {advertised} result page(s)")
         return extra
+
+    @staticmethod
+    def _pages_advertised(nav) -> int:
+        """Highest page number the pager mentions, link or not."""
+        highest = 1
+        for el in nav.find_all(True):
+            text = el.get_text(strip=True)
+            if text.isdigit():
+                highest = max(highest, int(text))
+        return highest
+
+    @staticmethod
+    def _next_control(links):
+        """The 'go forward a window' control, when no numbered link is left."""
+        wanted = (">", ">>", "»", "next", "next >", "...", "\u2026")
+        for a in links:
+            text = a.get_text(strip=True)
+            if text.lower() in wanted:
+                return text
+        return None
+
+    @staticmethod
+    def _current_page(html):
+        """Which page the pager says we are on (rendered unlinked)."""
+        soup = BeautifulSoup(html, "html.parser")
+        nav = soup.find(id="pnlNavigate")
+        if not nav:
+            return None
+        for el in nav.find_all(["span", "b", "strong", "font", "td"]):
+            if el.find("a"):
+                continue
+            text = el.get_text(strip=True)
+            if text.isdigit():
+                return int(text)
+        return None
 
     @staticmethod
     def _dedupe(records):
@@ -682,6 +823,14 @@ class LADBSScraper:
                 "summary": summary,
                 "diagnostics": self._diag,
             }
+
+        with_image = sum(1 for r in records if r.get("has_digital_image"))
+        icons = sum(1 for r in records if r.get("image_icon_in_row"))
+        self._diag["records_with_image"] = with_image
+        self._diag["rows_showing_image_icon"] = icons
+        if icons > with_image:
+            self._warn(f"{icons} row(s) show an image icon but only {with_image} "
+                       f"yielded a document id — image extraction is incomplete")
 
         if include_details:
             await self._fetch_details(records)

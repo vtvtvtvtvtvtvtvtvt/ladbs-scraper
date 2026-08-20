@@ -40,9 +40,14 @@ Returns `{"status": "ok"}` — use to confirm the service is running.
   "ain": "5467018015",
   "include_details": true,
   "time_budget_seconds": 150,
-  "parcel_mode": "all"
+  "parcel_mode": "all",
+  "debug": false
 }
 ```
+
+`debug: true` adds the raw results-grid rows and pager markup to
+`diagnostics`, which is how to diagnose a parsing gap from one call instead of
+guessing at the page structure.
 
 Unknown fields are **rejected with a 422**, not ignored — an option that is
 silently dropped makes a caller believe it took effect.
@@ -214,6 +219,8 @@ the same lines are written to the Railway logs.
 | `checkboxes_found: 0` on a real parcel | The first search step didn't match — check `parsed_address` / `parsed_ain` in the diagnostics. |
 | `detail_error: Session expired` | The detail page was requested outside the search session. |
 | `status: "blocked"` | Upstream served a block or error page. `page_snapshot.visible_text` quotes it. |
+| `rows_showing_image_icon` > `records_with_image` | Rows show an image icon but no document id could be extracted — the image parser is missing a link shape. Re-run with `"debug": true` and inspect `grid_html_sample`. |
+| `result_pages` < `pages_advertised` | Not every result page was read; the response is marked `truncated`. |
 | `status: "partial"` | The time budget ran out. Raise `SCRAPE_TIMEOUT_SECONDS` or pass `include_details: false`. |
 | Empty records but no warnings | The parcel genuinely has no IDIS documents. |
 
@@ -230,6 +237,19 @@ passes an AIN where an address is expected still gets results.
 150) and returns what it has with `status: "partial"`. Keep your client's own
 timeout **above** this value — otherwise the client aborts a request the
 service was about to answer, and you lose records that were already collected.
+
+**Images:** a row's document link carries a `Hidden`/`Visible` flag, but that
+only says whether the image pane opens expanded — it does **not** say whether
+an image exists. `has_digital_image` is driven by whether a document GUID
+appears anywhere in the row; the flag is reported separately as
+`image_pane_visible`. Gating on the flag hid the image for every row that
+defaulted to Hidden, which is most of them.
+
+**Paging:** the pager shows a moving window of page numbers plus a next
+control. Following only the numbered links stops at the end of the first
+window, so the next/ellipsis control is followed too, and the page count the
+pager advertises is compared against the pages actually read — a short read is
+always marked `truncated`.
 
 **Parcel fan-out:** an address matching many parcels used to mean one complete
 search per parcel, which is what pushed busy addresses past the budget.

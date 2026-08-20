@@ -46,6 +46,9 @@ class ScrapeRequest(BaseModel):
     # "all" submits every matched parcel at once; "each" walks them one at a
     # time (slower, kept as a fallback).
     parcel_mode: str = Field(default="all", pattern="^(all|each)$")
+    # Returns the raw results-grid and pager markup in diagnostics, for
+    # diagnosing a parsing gap without a screenshot.
+    debug: bool = False
 
 @app.get("/health")
 def health():
@@ -78,6 +81,7 @@ async def scrape(request: ScrapeRequest):
     scraper = LADBSScraper(
         budget_seconds=request.time_budget_seconds,
         parcel_mode=request.parcel_mode,
+        debug=request.debug,
     )
 
     # Prefer AIN over address if both provided

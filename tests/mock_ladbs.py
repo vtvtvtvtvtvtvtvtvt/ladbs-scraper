@@ -57,6 +57,21 @@ for _p in FAN_PARCELS:
             for j in range(5)]
     }
 
+# A parcel like 234 Museum Dr: 5 pages behind a windowed pager, and rows whose
+# image pane defaults to Hidden even though the document has an image.
+WINDOW_LABEL = "234 MUSEUM DR"
+WINDOW_PARCELS = [{"id": "chkAddress$5", "dom_id": "chkAddress_5",
+                   "label": WINDOW_LABEL}]
+RECORDS[WINDOW_LABEL] = {
+    page: [(f"{800 + page * 10 + j}", "Building Permit", "Alteration",
+            "04/10/1983", f"1983LA{64434 + page * 10 + j}",
+            # Only the first row of page 1 opens Visible; the rest are Hidden
+            # but still carry a document id.
+            "{%08d-aaaa-bbbb-cccc-%012d}" % (page, j) if j < 4 else "")
+           for j in range(5)]
+    for page in range(1, 6)
+}
+
 _counter = itertools.count(1)
 
 
@@ -108,9 +123,13 @@ def _results_page(labels, page_no, viewstate):
     rows = ["<tr><th>#</th><th>Document Type</th><th>Sub Type</th>"
             "<th>Date</th><th>Number</th></tr>"]
     for i, (rid, dtype, sub, date, num, guid) in enumerate(pages.get(page_no, [])):
-        vis = "Visible" if guid else "Hidden"
+        # Real LADBS rows are mostly Hidden even when an image exists; only the
+        # occasional row opens Visible.
+        vis = "Visible" if (guid and i == 0 and page_no == 1) else "Hidden"
+        icon = (f"<a href=\"javascript:OpenImage('{guid}')\">"
+                f"<img src='/images/camera.gif' alt='Digital Image'/></a>") if guid else ""
         rows.append(
-            f"<tr><td>{i+1}</td>"
+            f"<tr><td>{i+1}{icon}</td>"
             f"<td><a href=\"javascript:OpenWindow('{rid}','{vis}','{guid}')\">{dtype}</a></td>"
             f"<td>{sub}</td><td>{date}</td><td>{num}</td>"
             f"<td><input type='hidden' id='grd_hidComments_{i}' value='note {rid}'/></td></tr>")
@@ -118,14 +137,26 @@ def _results_page(labels, page_no, viewstate):
 
     nav = ""
     if len(pages) > 1:
+        all_pages = sorted(pages)
+        windowed = WINDOW_LABEL in labels
+        if windowed:
+            start = ((page_no - 1) // 3) * 3
+            shown = all_pages[start:start + 3]
+        else:
+            shown = all_pages
         links = []
-        for p in sorted(pages):
+        for p in shown:
             if p == page_no:
                 links.append(f"<span>{p}</span>")
             else:
                 links.append(
                     f"<a href=\"javascript:void(0)\" "
                     f"onclick=\"document.getElementById('pg{p}').submit();return false;\">{p}</a>")
+        if windowed and shown and shown[-1] < all_pages[-1]:
+            nxt = shown[-1] + 1
+            links.append(
+                f"<a href=\"javascript:void(0)\" "
+                f"onclick=\"document.getElementById('pg{nxt}').submit();return false;\">&gt;</a>")
         forms = "".join(
             f"<form id='pg{p}' method='post' action='{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ASSR'>"
             f"<input type='hidden' name='__VIEWSTATE' value='{viewstate}'/>"
@@ -255,6 +286,8 @@ class Handler(BaseHTTPRequestHandler):
                        one("Assessor$txtAssessorNoParcel"))
                 if ain == ("9999", "999", "999"):        # high-history parcel
                     ok, parcels = True, BULK_PARCELS
+                elif ain == ("5467", "018", "015"):      # windowed pager, 5 pages
+                    ok, parcels = True, WINDOW_PARCELS
                 elif ain == ("7777", "777", "777"):      # 24-parcel address
                     ok, parcels = True, FAN_PARCELS
                 elif ain == ("4030", "030", "030"):      # upstream refuses us
