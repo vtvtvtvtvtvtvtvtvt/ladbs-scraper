@@ -36,9 +36,34 @@ Returns `{"status": "ok"}` — use to confirm the service is running.
 ### `POST /scrape`
 ```json
 {
-  "address": "2100 Cypress Ave, Los Angeles, CA 90065"
+  "address": "2100 Cypress Ave, Los Angeles, CA 90065",
+  "ain": "5467018015",
+  "include_details": true
 }
 ```
+
+Send `address` **or** `ain` (`ain` wins if both are present). An `address` that
+is really a parcel number is detected and routed to the AIN search.
+
+`include_details` (default `true`) controls whether the scraper opens the
+detail page for every record. Those pages are the bulk of a scrape's runtime —
+a parcel with 500 documents means 500 extra round trips — and they only add
+fields like `status` and `applicant`. **If you render the grid columns
+(`doc_type`, `sub_type`, `doc_date`, `doc_number`, `digital_image_url`), send
+`"include_details": false` and results come back in a fraction of the time.**
+
+Every response carries a `status`:
+
+| `status` | meaning | how a caller should treat it |
+| --- | --- | --- |
+| `ok` | search completed, records returned | success |
+| `partial` | records returned, but the time budget ran out first | success, flag as incomplete; raise `SCRAPE_TIMEOUT_SECONDS` or turn off details |
+| `no_records` | search completed, the parcel genuinely has nothing | success — show a quiet "no records", not an error |
+| `blocked` | upstream refused the request (block page, session expiry, missing form) | **failure** — do not show as "no records"; retry later |
+
+`no_records` and `blocked` both come back with zero records, so a caller that
+only counts records cannot tell a dead scrape from an empty parcel. Branch on
+`status`.
 
 **Response:**
 ```json
@@ -175,6 +200,8 @@ the same lines are written to the Railway logs.
 | `no field matched for <field>` | LADBS renamed a form input. Update the selector list in `scraper.py`. |
 | `checkboxes_found: 0` on a real parcel | The first search step didn't match — check `parsed_address` / `parsed_ain` in the diagnostics. |
 | `detail_error: Session expired` | The detail page was requested outside the search session. |
+| `status: "blocked"` | Upstream served a block or error page. `page_snapshot.visible_text` quotes it. |
+| `status: "partial"` | The time budget ran out. Raise `SCRAPE_TIMEOUT_SECONDS` or pass `include_details: false`. |
 | Empty records but no warnings | The parcel genuinely has no IDIS documents. |
 
 **LADBS only covers the City of Los Angeles.** Pasadena, Glendale, Burbank,
@@ -185,6 +212,15 @@ of them, the summary says so instead of just reporting nothing found.
 **AIN in the address field:** `POST /scrape` with `{"address": "5467018015"}`
 is detected as a parcel number and routed to the AIN search, so a caller that
 passes an AIN where an address is expected still gets results.
+
+**Timeouts:** a scrape stops collecting at `SCRAPE_TIMEOUT_SECONDS` (default
+150) and returns what it has with `status: "partial"`. Keep your client's own
+timeout **above** this value — otherwise the client aborts a request the
+service was about to answer, and you lose records that were already collected.
+
+**Concurrency:** detail pages are fetched `LADBS_DETAIL_CONCURRENCY` at a time
+(default 6) through one browser context, which shares the session cookie. Raise
+it for speed, lower it if LADBS starts throttling.
 
 **Address parsing:** LADBS wants the bare street name. `parse_address` strips
 the house number, a directional prefix and the street-type suffix, so
@@ -197,6 +233,19 @@ server issued for *that* page in *that* session. The scraper therefore performs
 every step — search, parcel selection, paging and detail pages — in one
 Playwright context, and never replays captured tokens over a separate HTTP
 client.
+
+---
+
+## If you keep a copy of this service in another repo
+
+Copies drift. The scrape path here talks to LADBS **only** through the
+Playwright browser context — it does not build its own HTTP requests and does
+not set `Referer`, `Origin` or a hand-written `User-Agent` on any LADBS
+request. An older revision did, replaying `__VIEWSTATE` over `httpx` with
+forged headers; that pattern is both session-fragile and the shape upstream
+filtering rejects, and a copy still carrying it can return empty results that
+look like clean successes. If you are syncing a vendored copy, take this
+version wholesale rather than porting individual changes onto the old one.
 
 ---
 

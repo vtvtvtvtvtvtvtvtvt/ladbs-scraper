@@ -34,6 +34,15 @@ RECORDS = {
     },
 }
 
+# A high-history parcel: what a busy LA property looks like.
+BULK_LABEL = "1000 BULK AVE"
+BULK_PARCELS = [{"id": "chkAddress$9", "dom_id": "chkAddress_9", "label": BULK_LABEL}]
+RECORDS[BULK_LABEL] = {
+    1: [(str(500 + i), "Building Permit", "Alteration", "01/01/1990",
+         f"90010-10000-{i:05d}", "{G-%d}" % i if i % 3 == 0 else "")
+        for i in range(60)]
+}
+
 _counter = itertools.count(1)
 
 
@@ -43,6 +52,7 @@ class _State:
         self.stale_rejections = 0   # posts carrying a token this session never got
         self.hits = []              # request log
         self.searched = set()       # sids that actually ran a document search
+        self.detail_delay = 0.0     # simulate real per-request network latency
 
 
 STATE = _State()
@@ -176,6 +186,9 @@ class Handler(BaseHTTPRequestHandler):
             rid = (qs.get("Record_Id") or ["?"])[0]
             if sid not in STATE.searched:
                 return self._redirect(f"{IDIS}/SessionExpired.aspx", sid, is_new)
+            if STATE.detail_delay:
+                import time as _t
+                _t.sleep(STATE.detail_delay)
             return self._send(
                 f"<html><body><h3>Record {rid}</h3>"
                 f"<b>Address:</b> 2100 CYPRESS AVE<br/>"
@@ -205,10 +218,20 @@ class Handler(BaseHTTPRequestHandler):
 
         # Step 1 submissions -> parcel selection page
         if "btnSearchAssessor" in form or "btnNext1" in form:
+            parcels = PARCELS
             if "btnSearchAssessor" in form:
-                ok = (one("Assessor$txtAssessorNoBook") == "5443"
-                      and one("Assessor$txtAssessorNoPage") == "016"
-                      and one("Assessor$txtAssessorNoParcel") == "018")
+                ain = (one("Assessor$txtAssessorNoBook"),
+                       one("Assessor$txtAssessorNoPage"),
+                       one("Assessor$txtAssessorNoParcel"))
+                if ain == ("9999", "999", "999"):        # high-history parcel
+                    ok, parcels = True, BULK_PARCELS
+                elif ain == ("4030", "030", "030"):      # upstream refuses us
+                    return self._send(
+                        "<html><head><title>Access Denied</title></head><body>"
+                        "<h1>Access Denied</h1><p>Your request was blocked.</p>"
+                        "</body></html>", sid, is_new)
+                else:
+                    ok = ain == ("5443", "016", "018")
             else:
                 ok = (one("Address$txtAddressBegNo") == "2100"
                       and one("Address$txtAddressStreetName").upper() == "CYPRESS")
@@ -217,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
                     "<html><body>No parcels matched your search.</body></html>", sid, is_new)
 
             boxes = ["<input type='checkbox' id='CheckAll' name='CheckAll' value='on'/> All<br/>"]
-            for p in PARCELS:
+            for p in parcels:
                 boxes.append(
                     f"<input type='checkbox' id='{p['dom_id']}' name='{p['id']}' "
                     f"value='{p['label']}'/> {p['label']}<br/>")

@@ -31,6 +31,10 @@ app.add_middleware(
 class ScrapeRequest(BaseModel):
     address: Optional[str] = None
     ain: Optional[str] = None
+    # Detail pages are the bulk of a scrape's runtime and add only fields like
+    # status/applicant. Callers that render the grid columns (type, sub-type,
+    # date, number, image link) can set this false and get results in seconds.
+    include_details: bool = True
 
 @app.get("/health")
 def health():
@@ -39,7 +43,13 @@ def health():
 def _log_if_empty(result: dict, identifier: str):
     """An empty result is usually a broken flow, not an empty parcel — say why."""
     if result.get("total_records"):
+        if result.get("status") == "partial":
+            logger.warning(
+                f"{identifier}: returned {result['total_records']} record(s) but hit "
+                f"the time budget — raise SCRAPE_TIMEOUT_SECONDS or pass "
+                f"include_details=false")
         return
+    logger.warning(f"{identifier}: status={result.get('status')}")
     diag = result.get("diagnostics", {}) or {}
     logger.warning(f"No records for {identifier}. Steps: {diag.get('steps')}")
     for warning in diag.get("warnings", []):
@@ -60,7 +70,8 @@ async def scrape(request: ScrapeRequest):
     if request.ain:
         logger.info(f"Scrape request by AIN: {request.ain}")
         try:
-            result = await scraper.scrape_by_ain(request.ain)
+            result = await scraper.scrape_by_ain(
+                request.ain, include_details=request.include_details)
             _log_if_empty(result, f"AIN {request.ain}")
             return result
         except Exception as e:
@@ -70,7 +81,8 @@ async def scrape(request: ScrapeRequest):
     elif request.address:
         logger.info(f"Scrape request by address: {request.address}")
         try:
-            result = await scraper.scrape(request.address)
+            result = await scraper.scrape(
+                request.address, include_details=request.include_details)
             _log_if_empty(result, request.address)
             return result
         except Exception as e:
@@ -113,31 +125,28 @@ async def fetch_image(url: str = Query(...)):
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(2)
 
-            cookies = await context.cookies()
-            cookie_dict = {c["name"]: c["value"] for c in cookies}
+            # Fetch through the browser context so the request carries the
+            # session's own cookies and headers. Hand-built headers -- notably a
+            # forged Referer alongside a truncated User-Agent -- are exactly the
+            # shape upstream filtering rejects.
+            resp = await context.request.get(pdf_url, headers={"Accept": "application/pdf,*/*"})
+            body = await resp.body()
 
-            async with httpx.AsyncClient(cookies=cookie_dict, follow_redirects=True, timeout=60) as client:
-                resp = await client.get(pdf_url, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Referer": url,
-                    "Accept": "application/pdf,*/*",
-                })
+            ct = resp.headers.get("content-type", "")
+            size = len(body)
+            logger.info(f"StPdfViewer: status={resp.status} ct={ct} size={size}")
 
-                ct = resp.headers.get("content-type", "")
-                size = len(resp.content)
-                logger.info(f"StPdfViewer: status={resp.status_code} ct={ct} size={size}")
+            if size > 500 and "html" not in ct.lower():
+                return StreamingResponse(
+                    io.BytesIO(body),
+                    media_type="application/pdf",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="ladbs_{guid}.pdf"',
+                        "Content-Length": str(size),
+                    }
+                )
 
-                if size > 500 and "html" not in ct.lower():
-                    return StreamingResponse(
-                        io.BytesIO(resp.content),
-                        media_type="application/pdf",
-                        headers={
-                            "Content-Disposition": f'attachment; filename="ladbs_{guid}.pdf"',
-                            "Content-Length": str(size),
-                        }
-                    )
-
-                raise HTTPException(status_code=422, detail=f"Could not retrieve PDF ({size} bytes, ct={ct})")
+            raise HTTPException(status_code=422, detail=f"Could not retrieve PDF ({size} bytes, ct={ct})")
 
         except HTTPException:
             raise

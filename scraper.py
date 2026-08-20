@@ -24,6 +24,21 @@ MAX_RESULT_PAGES = 25
 # as truncated, rather than letting the caller time out with nothing.
 SCRAPE_BUDGET_SECONDS = float(os.environ.get("SCRAPE_TIMEOUT_SECONDS", "150"))
 
+# Detail pages are independent GETs, and a busy parcel has hundreds of them.
+# Fetched one at a time they dominate the whole scrape; a small pool cuts that
+# to a fraction while staying polite enough not to trip upstream throttling.
+DETAIL_CONCURRENCY = int(os.environ.get("LADBS_DETAIL_CONCURRENCY", "6"))
+
+# Text that means the upstream refused us rather than "this parcel is empty".
+# An empty result caused by one of these is a failure and must be reported as
+# one; a genuinely permit-free parcel must stay quiet.
+BLOCK_SIGNS = (
+    "access denied", "forbidden", "request blocked", "request unsuccessful",
+    "incapsula", "cloudflare", "unusual traffic", "rate limit", "too many requests",
+    "session has expired", "session expired", "sessionexpired",
+    "an error has occurred", "service unavailable", "temporarily unavailable",
+)
+
 DIRECTIONS = {
     "N", "S", "E", "W", "NE", "NW", "SE", "SW",
     "NORTH", "SOUTH", "EAST", "WEST",
@@ -244,11 +259,11 @@ class LADBSScraper:
 
     # ---------------- public API ----------------
 
-    async def scrape(self, address: str) -> dict:
+    async def scrape(self, address: str, include_details: bool = True) -> dict:
         """Search by street address (or by AIN, if that is what was passed)."""
         if looks_like_ain(address):
             logger.info(f"{address!r} is an AIN, not an address — searching by AIN")
-            result = await self.scrape_by_ain(address)
+            result = await self.scrape_by_ain(address, include_details=include_details)
             result["address"] = address
             result["diagnostics"]["routed"] = (
                 "value looked like an AIN, so the AIN search was used")
@@ -268,11 +283,12 @@ class LADBSScraper:
             records = await self._collect_records(
                 lambda: self._start_address_search(number, street_name, direction)
             )
-            return await self._finish(records, "address", address, f"{address}")
+            return await self._finish(
+                records, "address", address, f"{address}", include_details)
 
         return await self._run(worker)
 
-    async def scrape_by_ain(self, ain: str) -> dict:
+    async def scrape_by_ain(self, ain: str, include_details: bool = True) -> dict:
         """Search by Assessor Identification Number (APN)."""
         book, pg, parcel = split_ain(ain)
         logger.info(f"AIN split: book={book} page={pg} parcel={parcel}")
@@ -282,7 +298,8 @@ class LADBSScraper:
             records = await self._collect_records(
                 lambda: self._start_ain_search(book, pg, parcel)
             )
-            return await self._finish(records, "ain", ain, f"AIN {format_ain(ain)}")
+            return await self._finish(
+                records, "ain", ain, f"AIN {format_ain(ain)}", include_details)
 
         return await self._run(worker)
 
@@ -393,6 +410,7 @@ class LADBSScraper:
             except Exception as e:
                 self._warn(f"fill {label} via {sel} failed: {e}")
         self._warn(f"no field matched for {label}; tried {selectors}")
+        self._diag["search_form_missing"] = True
         return False
 
     async def _click_first(self, selectors, label, required=True):
@@ -596,19 +614,28 @@ class LADBSScraper:
 
     # ---------------- detail pages ----------------
 
-    async def _finish(self, records, key, key_value, identifier):
+    async def _finish(self, records, key, key_value, identifier,
+                      include_details: bool = True):
         self._step(f"total unique records: {len(records)}")
         if not records:
-            self._diag["page_snapshot"] = await self._snapshot()
+            snapshot = await self._snapshot()
+            self._diag["page_snapshot"] = snapshot
+            status, reason = self._classify_empty(snapshot)
             summary = f"No records found for {identifier}."
-            outside = self._diag.get("outside_jurisdiction")
-            if outside:
-                summary += (
-                    f" {outside} is outside the City of Los Angeles, and LADBS"
-                    f" only holds records for properties inside the city — check"
-                    f" the {outside} building department instead.")
+            if status == "blocked":
+                summary = (f"LADBS did not return results for {identifier}: {reason}. "
+                           f"This is a failure, not an empty parcel — retry later.")
+                self._warn(f"upstream refusal: {reason}")
+            else:
+                outside = self._diag.get("outside_jurisdiction")
+                if outside:
+                    summary += (
+                        f" {outside} is outside the City of Los Angeles, and LADBS"
+                        f" only holds records for properties inside the city — check"
+                        f" the {outside} building department instead.")
             return {
                 key: key_value,
+                "status": status,
                 "total_records": 0,
                 "records": [],
                 "attachments": [],
@@ -616,41 +643,93 @@ class LADBSScraper:
                 "diagnostics": self._diag,
             }
 
-        detailed = []
+        if include_details:
+            await self._fetch_details(records)
+        else:
+            self._step("detail pages skipped (include_details=false)")
+            self._diag["details_fetched"] = False
+
         all_attachments = []
-        for i, rec in enumerate(records):
-            if self._out_of_time(
-                    f"skipped detail lookups for {len(records) - i} record(s)"):
-                for skipped in records[i:]:
-                    skipped["detail_error"] = "skipped: scrape time budget spent"
-                    detailed.append(skipped)
-                    all_attachments.extend(skipped.get("attachments", []))
-                break
-
-            logger.info(f"Detail {i+1}/{len(records)}: {rec['doc_type']} {rec['doc_number']}")
-            try:
-                # Report.aspx is a static page; no settle needed.
-                await self._goto(rec["detail_url"], settle=0.2)
-                if "SessionExpired" in self._page.url or "IdisError" in self._page.url:
-                    self._warn(f"session expired on detail {i+1}")
-                    rec["detail_error"] = "Session expired"
-                else:
-                    rec.update(self._parse_detail_html(await self._page.content()))
-            except Exception as e:
-                self._warn(f"detail {i+1} failed: {e}")
-                rec["detail_error"] = str(e)
-
-            detailed.append(rec)
+        for rec in records:
             all_attachments.extend(rec.get("attachments", []))
 
         return {
             key: key_value,
-            "total_records": len(detailed),
-            "records": detailed,
+            "status": "partial" if self._diag.get("truncated") else "ok",
+            "total_records": len(records),
+            "records": records,
             "attachments": all_attachments,
-            "summary": self._build_summary(detailed, identifier),
+            "summary": self._build_summary(records, identifier),
             "diagnostics": self._diag,
         }
+
+    def _classify_empty(self, snapshot):
+        """Separate an upstream refusal from a parcel that truly has nothing."""
+        haystack = " ".join([
+            snapshot.get("visible_text", ""), snapshot.get("title", ""),
+        ]).lower()
+        for sign in BLOCK_SIGNS:
+            if sign in haystack:
+                return "blocked", f"upstream returned {sign!r}"
+        if self._diag.get("search_form_missing"):
+            return "blocked", "the LADBS search form was not on the page"
+        return "no_records", ""
+
+    async def _fetch_details(self, records):
+        """Load every record's detail page, a few at a time.
+
+        Serially this is the whole cost of a scrape: a parcel with 500 records
+        spends minutes on round trips that do not depend on each other. A small
+        pool of pages in the same browser context shares the session cookie, so
+        concurrency costs nothing in correctness.
+        """
+        width = max(1, min(DETAIL_CONCURRENCY, len(records)))
+        self._step(f"fetching {len(records)} detail page(s), {width} at a time")
+
+        pool = asyncio.Queue()
+        pages = []
+        for _ in range(width):
+            page = await self._context.new_page()
+            pages.append(page)
+            pool.put_nowait(page)
+
+        skipped = {"n": 0}
+
+        async def fetch(index, rec):
+            if self._time_left() <= 0:
+                skipped["n"] += 1
+                rec["detail_error"] = "skipped: scrape time budget spent"
+                return
+            page = await pool.get()
+            try:
+                timeout = max(5000, min(NAV_TIMEOUT, int(self._time_left() * 1000)))
+                await page.goto(rec["detail_url"], wait_until="domcontentloaded",
+                                timeout=timeout)
+                if "SessionExpired" in page.url or "IdisError" in page.url:
+                    rec["detail_error"] = "Session expired"
+                else:
+                    rec.update(self._parse_detail_html(await page.content()))
+            except Exception as e:
+                rec["detail_error"] = str(e)
+            finally:
+                pool.put_nowait(page)
+
+        try:
+            await asyncio.gather(*(fetch(i, r) for i, r in enumerate(records)))
+        finally:
+            for page in pages:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+        if skipped["n"]:
+            self._diag["truncated"] = True
+            self._warn(f"time budget spent — skipped {skipped['n']} detail lookup(s)")
+        failed = sum(1 for r in records if "detail_error" in r)
+        self._diag["details_fetched"] = True
+        self._diag["detail_failures"] = failed
+        self._step(f"details done: {len(records) - failed} ok, {failed} failed/skipped")
 
     def _parse_detail_html(self, html: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
