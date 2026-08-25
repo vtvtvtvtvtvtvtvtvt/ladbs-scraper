@@ -267,6 +267,13 @@ carries "Display Fields" checkboxes (All Fields, Frac, Unit, Zip Code) and an
 `Select` / `Beg Nbr` / `Str Name` column headings so those controls are never
 submitted as if they were parcels.
 
+**Image links need `include_details: true`.** Most result rows show an image
+icon but carry no document id in the grid — the id is on the record's own
+`Report.aspx` page, which is only fetched when details are on. With details off
+you get the records but almost none of the image links, and the response says
+so. `diagnostics.image_ids_from_grid` and `image_ids_from_detail` report where
+each id came from, and `record.image_source` marks it per record.
+
 **Images:** a row's document link carries a `Hidden`/`Visible` flag, but that
 only says whether the image pane opens expanded — it does **not** say whether
 an image exists. `has_digital_image` is driven by whether a document GUID

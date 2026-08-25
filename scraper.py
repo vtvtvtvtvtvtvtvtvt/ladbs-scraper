@@ -164,6 +164,44 @@ IMAGE_GUID_RE = re.compile(r"\{[0-9a-fA-F][0-9a-fA-F\-]{7,}\}")
 # Attributes anywhere in a row that can carry an image reference.
 LINK_ATTRS = ("href", "onclick", "src", "value", "data-docids")
 
+# Substrings marking a link as the one that opens a document image.
+IMAGE_LINK_HINTS = ("imagemain", "docids", "stpdfviewer", "openimage",
+                    "viewimage", "imagetoopen")
+
+
+def detail_image_guids(html: str) -> list:
+    """Document ids on a record's detail page.
+
+    Most result rows show an image icon but carry no id in the grid — the id
+    lives on the record's own page. Links that name the image viewer are
+    preferred; any id on the page is accepted as a fallback.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    preferred, other = [], []
+    for el in soup.find_all(True):
+        for attr in LINK_ATTRS:
+            value = el.get(attr)
+            if not isinstance(value, str):
+                continue
+            found = IMAGE_GUID_RE.findall(value)
+            if not found:
+                continue
+            bucket = (preferred if any(h in value.lower() for h in IMAGE_LINK_HINTS)
+                      else other)
+            for guid in found:
+                if guid not in bucket:
+                    bucket.append(guid)
+    if preferred:
+        return preferred
+    if other:
+        return other
+    # Nothing in an attribute: fall back to any id in the markup.
+    seen = []
+    for guid in IMAGE_GUID_RE.findall(html):
+        if guid not in seen:
+            seen.append(guid)
+    return seen
+
 
 def row_image_guids(row, primary_guid: str) -> list:
     """Every document GUID referenced anywhere in a result row.
@@ -249,7 +287,10 @@ def parse_results_html(html: str) -> list:
             digital_image_url = (
                 f"{BASE_URL}/ImageMain.aspx?DocIds={','.join(guids)}")
 
-        detail_url = f"{BASE_URL}/Report.aspx?Record_Id={record_id}&Image=Hidden&ImageToOpen="
+        # Image=Visible so the page renders its document link; Hidden asks
+        # LADBS to leave it out, which is where the id would have come from.
+        detail_url = (f"{BASE_URL}/Report.aspx?Record_Id={record_id}"
+                      f"&Image=Visible&ImageToOpen=")
 
         record = {
             "record_id": record_id,
@@ -270,6 +311,7 @@ def parse_results_html(html: str) -> list:
         }
 
         if digital_image_url:
+            record["image_source"] = "grid"
             record["attachments"].append({
                 "label": f"Digital Image - {doc_type} {doc_number}",
                 "url": digital_image_url,
@@ -1122,19 +1164,33 @@ class LADBSScraper:
                 "diagnostics": self._diag,
             }
 
-        with_image = sum(1 for r in records if r.get("has_digital_image"))
         icons = sum(1 for r in records if r.get("image_icon_in_row"))
-        self._diag["records_with_image"] = with_image
-        self._diag["rows_showing_image_icon"] = icons
-        if icons > with_image:
-            self._warn(f"{icons} row(s) show an image icon but only {with_image} "
-                       f"yielded a document id — image extraction is incomplete")
+        from_grid = sum(1 for r in records if r.get("has_digital_image"))
 
         if include_details:
             await self._fetch_details(records)
         else:
             self._step("detail pages skipped (include_details=false)")
             self._diag["details_fetched"] = False
+
+        with_image = sum(1 for r in records if r.get("has_digital_image"))
+        self._diag["rows_showing_image_icon"] = icons
+        self._diag["records_with_image"] = with_image
+        self._diag["image_ids_from_grid"] = from_grid
+        self._diag["image_ids_from_detail"] = sum(
+            1 for r in records if r.get("image_source") == "detail")
+
+        if icons > with_image:
+            if not include_details:
+                self._warn(
+                    f"{icons} row(s) show an image icon but only {with_image} "
+                    f"carry a document id, and detail pages were skipped. Most "
+                    f"ids are only on the record's own page — retry with "
+                    f"include_details=true to collect them.")
+            else:
+                self._warn(
+                    f"{icons} row(s) show an image icon but only {with_image} "
+                    f"yielded a document id — image extraction is incomplete")
 
         all_attachments = []
         for rec in records:
@@ -1195,7 +1251,10 @@ class LADBSScraper:
                 if "SessionExpired" in page.url or "IdisError" in page.url:
                     rec["detail_error"] = "Session expired"
                 else:
-                    rec.update(self._parse_detail_html(await page.content()))
+                    detail_html = await page.content()
+                    rec.update(self._parse_detail_html(detail_html))
+                    if not rec.get("has_digital_image"):
+                        self._adopt_detail_image(rec, detail_html)
             except Exception as e:
                 rec["detail_error"] = str(e)
             finally:
@@ -1217,6 +1276,23 @@ class LADBSScraper:
         self._diag["details_fetched"] = True
         self._diag["detail_failures"] = failed
         self._step(f"details done: {len(records) - failed} ok, {failed} failed/skipped")
+
+    @staticmethod
+    def _adopt_detail_image(rec, detail_html):
+        """Take the document id from the record's own page, if it has one."""
+        guids = detail_image_guids(detail_html)
+        if not guids:
+            return
+        rec["digital_image_url"] = (
+            f"{BASE_URL}/ImageMain.aspx?DocIds={','.join(guids)}")
+        rec["has_digital_image"] = True
+        rec["image_source"] = "detail"
+        rec["attachments"].append({
+            "label": f"Digital Image - {rec.get('doc_type', '')} "
+                     f"{rec.get('doc_number', '')}".strip(),
+            "url": rec["digital_image_url"],
+            "type": "digital_image",
+        })
 
     def _parse_detail_html(self, html: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")

@@ -106,6 +106,15 @@ for _i, _p in enumerate(CYPRESS_PARCELS):
             for j in range(4)]
     }
 
+ICON_LABEL = "900 ICONS BLVD"
+ICON_PARCELS = [{"id": "chkAddress$i0", "dom_id": "chkAddress_i0",
+                 "label": ICON_LABEL}]
+RECORDS[ICON_LABEL] = {
+    1: [(f"{400 + j}", "Building Permit", "Alteration", "09/02/2005",
+         f"05016-10000-{18708 + j}", f"ICON:{j}")
+        for j in range(8)]
+}
+
 _counter = itertools.count(1)
 
 
@@ -159,12 +168,20 @@ def _results_page(labels, page_no, viewstate):
     for i, (rid, dtype, sub, date, num, guid) in enumerate(pages.get(page_no, [])):
         # Real LADBS rows are mostly Hidden even when an image exists; only the
         # occasional row opens Visible.
-        vis = "Visible" if (guid and i == 0 and page_no == 1) else "Hidden"
-        icon = (f"<a href=\"javascript:OpenImage('{guid}')\">"
-                f"<img src='/images/camera.gif' alt='Digital Image'/></a>") if guid else ""
+        icon_only = guid.startswith("ICON:")
+        real_guid = "" if icon_only else guid
+        vis = "Visible" if (real_guid and i == 0 and page_no == 1) else "Hidden"
+        if icon_only:
+            # Like the real grid: an icon saying an image exists, no id here.
+            icon = "<img src='/images/camera.gif' alt='Digital Image'/>"
+        elif guid:
+            icon = (f"<a href=\"javascript:OpenImage('{guid}')\">"
+                    f"<img src='/images/camera.gif' alt='Digital Image'/></a>")
+        else:
+            icon = ""
         rows.append(
             f"<tr><td>{i+1}{icon}</td>"
-            f"<td><a href=\"javascript:OpenWindow('{rid}','{vis}','{guid}')\">{dtype}</a></td>"
+            f"<td><a href=\"javascript:OpenWindow('{rid}','{vis}','{real_guid}')\">{dtype}</a></td>"
             f"<td>{sub}</td><td>{date}</td><td>{num}</td>"
             f"<td><input type='hidden' id='grd_hidComments_{i}' value='note {rid}'/></td></tr>")
     grid = f"<table id='grdIdisResult'>{''.join(rows)}</table>"
@@ -284,11 +301,17 @@ class Handler(BaseHTTPRequestHandler):
             if STATE.detail_delay:
                 import time as _t
                 _t.sleep(STATE.detail_delay)
+            image_link = ""
+            if (qs.get("Image") or [""])[0] == "Visible":
+                guid = "{deadbeef-0000-1111-2222-%012d}" % int(rid)
+                image_link = (f"<a href='ImageMain.aspx?DocIds={guid}'>"
+                              f"View Digital Image</a>")
             return self._send(
                 f"<html><body><h3>Record {rid}</h3>"
                 f"<b>Address:</b> 2100 CYPRESS AVE<br/>"
                 f"<b>Status:</b> Finaled<br/>"
-                f"<b>Applicant:</b> ACME Builders</body></html>", sid, is_new)
+                f"<b>Applicant:</b> ACME Builders<br/>{image_link}</body></html>",
+                sid, is_new)
 
         return self._send("<html><body>LADBS mock home</body></html>", sid, is_new)
 
@@ -324,6 +347,8 @@ class Handler(BaseHTTPRequestHandler):
                     # Like the real site: the assessor lookup surfaces only
                     # the directional address row, not its sibling.
                     ok, parcels = True, WINDOW_PARCELS[1:]
+                elif ain == ("9000", "000", "000"):      # ids only on detail pages
+                    ok, parcels = True, ICON_PARCELS
                 elif ain == ("5468", "018", "015"):      # 5 pages, windowed pager
                     ok, parcels = True, PAGER_PARCELS
                 elif ain == ("7777", "777", "777"):      # 24-parcel address

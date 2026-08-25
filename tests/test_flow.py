@@ -66,8 +66,12 @@ class TestAinFlow:
             assert rec.get("applicant") == "ACME Builders"
 
     def test_attachments_collected(self, ain_result):
-        # Records 100 and 102 have digital images.
-        assert len(ain_result["attachments"]) == 2
+        # Records 100 and 102 carry an id in the grid; the other two get theirs
+        # from their detail pages, which is where most real ids live.
+        assert len(ain_result["attachments"]) == 4
+        sources = [r.get("image_source") for r in ain_result["records"]]
+        assert sources.count("grid") == 2
+        assert sources.count("detail") == 2
 
     def test_summary_and_echo(self, ain_result):
         assert ain_result["ain"] == "5443-016-018"
