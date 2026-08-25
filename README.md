@@ -55,10 +55,19 @@ silently dropped makes a caller believe it took effect.
 `time_budget_seconds` (10–900) overrides `SCRAPE_TIMEOUT_SECONDS` for one
 request, so a caller who can wait longer does not need the service redeployed.
 
-`parcel_mode` (`all` by default) decides how a multi-parcel address is handled.
-An LA address can match a couple of dozen assessor parcels: `all` ticks every
-parcel and submits once, `each` walks them one at a time — one full search per
-parcel, which is far slower and exists only as a fallback.
+`parcel_mode` (`auto` by default) decides how multiple matching address rows
+are handled. A search for "2100 Cypress" offers four — plain, `N`, `W`, and a
+`2100–2120` range — each holding its own documents.
+
+| mode | behaviour |
+| --- | --- |
+| `auto` | Submits every row together via the page's "All" control and, when there are at most `LADBS_FULL_WALK_MAX_ROWS` (6) rows, also walks them individually and merges. Cheap insurance if the site honours only one selection. |
+| `all` | One combined submit only. Use for an address matching dozens of rows, where the per-row walk is too slow. |
+| `each` | One search per row. Thorough, slowest. |
+
+`diagnostics.address_rows_found` and `address_rows_checked` report how many
+rows the page offered and how many were confirmed ticked — read back from the
+page, not assumed. `diagnostics.strategy` lists what each step contributed.
 
 Send `address`, `ain`, or **both**. When both are given, both searches run and
 the records are merged and deduplicated — they do not reach the same

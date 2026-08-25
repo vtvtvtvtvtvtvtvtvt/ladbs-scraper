@@ -29,6 +29,11 @@ SCRAPE_BUDGET_SECONDS = float(os.environ.get("SCRAPE_TIMEOUT_SECONDS", "150"))
 # to a fraction while staying polite enough not to trip upstream throttling.
 DETAIL_CONCURRENCY = int(os.environ.get("LADBS_DETAIL_CONCURRENCY", "6"))
 
+# With few address rows, submitting them together AND walking them one by one
+# costs little and guarantees nothing is missed if the site honours only the
+# first selection. Beyond this many rows the per-row walk is too expensive.
+FULL_WALK_MAX_ROWS = int(os.environ.get("LADBS_FULL_WALK_MAX_ROWS", "6"))
+
 # Text that means the upstream refused us rather than "this parcel is empty".
 # An empty result caused by one of these is a failure and must be reported as
 # one; a genuinely permit-free parcel must stay quiet.
@@ -291,14 +296,23 @@ NON_PARCEL_LABELS = (
 
 
 def find_parcel_table(soup):
-    """The grid of matching addresses, identified by its column headings."""
+    """The grid of matching addresses, identified by its column headings.
+
+    LADBS nests tables for layout, and find_all returns the outermost first —
+    matching on a joined string picks the page wrapper, whose rows include the
+    Display Fields controls. Match heading cells exactly and keep the
+    innermost table that qualifies.
+    """
+    candidates = []
     for table in soup.find_all("table"):
-        headings = " ".join(
-            cell.get_text(strip=True).lower()
-            for cell in table.find_all(["th", "td"], limit=12))
-        if "select" in headings and any(h in headings for h in PARCEL_HEADERS):
-            return table
-    return None
+        headings = {cell.get_text(strip=True).lower()
+                    for cell in table.find_all(["th", "td"], limit=14)}
+        if "select" in headings and headings & set(PARCEL_HEADERS):
+            candidates.append(table)
+    if not candidates:
+        return None
+    # The innermost qualifying table is the grid itself.
+    return min(candidates, key=lambda t: len(t.find_all("table")))
 
 
 def unresolved_image_row(html: str):
@@ -337,6 +351,10 @@ def parse_checkboxes(html: str) -> list:
             if not cb or not cb.get("name"):
                 continue
             cells = [c.get_text(" ", strip=True) for c in row.find_all("td")]
+            # An address row carries a street number; the Display Fields row
+            # and the All toggle do not.
+            if not any(re.search(r"\d", c) for c in cells):
+                continue
             label = " ".join(c for c in cells if c) or (cb.get("value") or "")
             pairs.append({
                 "name": cb.get("name", ""),
@@ -382,15 +400,18 @@ class LADBSScraper:
     """
 
     def __init__(self, headless: bool = True, budget_seconds: float = None,
-                 parcel_mode: str = "all", debug: bool = False):
+                 parcel_mode: str = "auto", debug: bool = False):
         # debug=True returns the raw results-grid and pager markup in
         # diagnostics, so a parsing gap can be diagnosed from one call
         # instead of guessing at the page's structure.
         self.debug = debug
         self.headless = headless
-        # "all": one submit covering every matched parcel (fast).
-        # "each": one search per parcel — the old behaviour, kept as a fallback.
-        self.parcel_mode = parcel_mode if parcel_mode in ("all", "each") else "all"
+        # "auto": submit every address row together and, when there are only a
+        #         few, also walk them one by one and merge.
+        # "all":  one combined submit only.
+        # "each": one search per address row only.
+        self.parcel_mode = (parcel_mode if parcel_mode in ("auto", "all", "each")
+                            else "auto")
         self.budget_seconds = (
             SCRAPE_BUDGET_SECONDS if budget_seconds is None else budget_seconds)
         self._page = None
@@ -772,64 +793,159 @@ class LADBSScraper:
             self._diag["final_html_len"] = len(html)
             return []
 
-        # An address can match many assessor parcels — 24 is a real case. Ask
-        # for all of them in one submit; the selection page is a plain
-        # multi-select, and its CheckAll box exists precisely for this. Walking
-        # them one at a time means re-running the whole search per parcel,
-        # which is what pushed busy addresses past the time budget.
-        if len(checkboxes) > 1 and self.parcel_mode == "all":
-            self._step(f"selecting all {len(checkboxes)} parcels in one submit: "
-                       f"{self._diag['parcels']}")
-            if await self._check_all_and_continue(checkboxes):
-                combined_html = await self._page.content()
-                self._capture_markup(combined_html)
-                records = parse_results_html(combined_html)
-                records += await self._paginate()
-                if records:
-                    self._diag["parcel_mode"] = "all"
-                    self._diag["parcels_selected"] = len(checkboxes)
-                    self._step(f"combined selection yielded {len(records)} record(s)")
-                    return self._dedupe(records)
-            self._warn("selecting all parcels returned nothing; falling back to "
-                       "one parcel at a time")
-            await restart()
+        return self._dedupe(await self._gather(checkboxes, restart))
 
-        self._diag["parcel_mode"] = "each"
-        all_records = []
-        for idx, cb in enumerate(checkboxes):
-            if self._out_of_time(
-                    f"stopped after {idx} of {len(checkboxes)} parcel(s)"):
+    async def _gather(self, rows, restart):
+        """Collect records for every matching address row.
+
+        "auto" (default) submits all rows together and, when there are only a
+        few, also walks them individually and merges — cheap insurance against
+        a site that honours just one selection. "all" submits together only;
+        "each" walks only.
+        """
+        mode = self.parcel_mode
+        combine = len(rows) > 1 and mode in ("auto", "all")
+        walk = (mode == "each"
+                or len(rows) == 1
+                or (mode == "auto" and len(rows) <= FULL_WALK_MAX_ROWS))
+
+        collected = []
+        self._diag["strategy"] = []
+
+        if combine:
+            self._step(f"submitting all {len(rows)} address row(s) together")
+            found = await self._submit_rows(rows)
+            self._diag["strategy"].append(
+                {"step": "combined", "rows": len(rows), "records": len(found)})
+            collected.extend(found)
+            if not found:
+                self._warn("combined submit returned nothing; walking rows individually")
+                walk = True
+
+        if walk:
+            page_is_fresh = not combine
+            found = await self._walk_rows(rows, restart, page_is_fresh)
+            collected.extend(found)
+
+        self._diag["parcel_mode"] = mode
+        return collected
+
+    async def _walk_rows(self, rows, restart, page_is_fresh):
+        out = []
+        for idx, cb in enumerate(rows):
+            if self._out_of_time(f"stopped after {idx} of {len(rows)} address row(s)"):
                 break
-            if idx > 0:
-                # Re-run the search so each selection starts from a fresh,
-                # server-issued __VIEWSTATE instead of a stale one.
+            if idx > 0 or not page_is_fresh:
+                # Each selection needs a fresh, server-issued __VIEWSTATE.
                 await restart()
-            self._step(f"selecting address {idx + 1}/{len(checkboxes)}: "
-                       f"{cb.get('label') or cb['name']}")
+            label = cb.get("label") or cb["name"]
+            self._step(f"selecting address {idx + 1}/{len(rows)}: {label}")
             if not await self._check_and_continue(cb):
                 continue
-            parcel_html = await self._page.content()
-            self._capture_markup(parcel_html)
-            page_records = parse_results_html(parcel_html)
-            page_records += await self._paginate()
-            self._step(f"  checkbox {idx + 1} yielded {len(page_records)} record(s)")
-            all_records.extend(page_records)
+            html = await self._page.content()
+            self._capture_markup(html)
+            found = parse_results_html(html) + await self._paginate()
+            self._step(f"  {label} yielded {len(found)} record(s)")
+            self._diag["strategy"].append(
+                {"step": "row", "row": label, "records": len(found)})
+            out.extend(found)
+        return out
 
-        return self._dedupe(all_records)
+    async def _submit_rows(self, rows):
+        """Tick every address row — via the page's All control where possible
+        — confirm the ticks landed, then submit once."""
+        if not await self._select_every_row(rows):
+            return []
+        if not await self._continue_to_documents():
+            return []
+        html = await self._page.content()
+        self._capture_markup(html)
+        return parse_results_html(html) + await self._paginate()
 
-    async def _check_all_and_continue(self, checkboxes):
-        """Tick every parcel box, then submit once."""
-        checked = 0
-        for cb in checkboxes:
-            if await self._check_box(cb):
-                checked += 1
-        if not checked:
-            self._warn("could not tick any parcel checkbox")
+    async def _select_every_row(self, rows):
+        """Check all address rows and verify, rather than assume, that they are.
+
+        The page offers an "All" toggle; use it first, since that is what a
+        person clicks and it carries whatever scripting the site expects.
+        """
+        used_all_control = await self._tick_all_control()
+        checked = await self._count_checked(rows)
+
+        if checked < len(rows):
+            if used_all_control:
+                self._step(f"All control checked {checked}/{len(rows)}; "
+                           f"ticking the remaining rows directly")
+            for cb in rows:
+                loc = self._locate_box(cb)
+                if loc is None:
+                    continue
+                try:
+                    if not await loc.is_checked():
+                        await loc.check(timeout=5000)
+                except Exception as e:
+                    self._warn(f"could not tick {cb.get('label') or cb['name']}: {e}")
+            checked = await self._count_checked(rows)
+
+        self._diag["address_rows_found"] = len(rows)
+        self._diag["address_rows_checked"] = checked
+        self._diag["used_all_control"] = used_all_control
+
+        if checked == 0:
+            self._warn("no address row could be ticked")
             return False
-        self._step(f"ticked {checked}/{len(checkboxes)} parcel checkbox(es)")
-        return await self._continue_to_documents()
+        if checked < len(rows):
+            self._warn(f"only {checked} of {len(rows)} address rows were ticked")
+        else:
+            self._step(f"all {checked} address row(s) ticked")
+        return True
 
-    async def _check_box(self, cb) -> bool:
+    async def _tick_all_control(self) -> bool:
+        """The page's own "All" checkbox, which selects every row at once."""
+        for sel in ('input[type="checkbox"][id="All"]',
+                    'input[type="checkbox"][name="All"]',
+                    'input[type="checkbox"][id="CheckAll"]',
+                    'input[type="checkbox"][name="CheckAll"]',
+                    'input[type="checkbox"][id*="chkAll" i]',
+                    'input[type="checkbox"][id*="SelectAll" i]'):
+            try:
+                loc = self._page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                await loc.check(timeout=5000)
+                self._step(f"clicked the page's All control ({sel})")
+                await asyncio.sleep(0.3)   # let its script tick the rows
+                return True
+            except Exception as e:
+                self._warn(f"All control {sel} failed: {e}")
+        return False
+
+    def _locate_box(self, cb):
+        for sel in self._box_selectors(cb):
+            try:
+                loc = self._page.locator(sel).first
+                if loc:
+                    return loc
+            except Exception:
+                continue
+        return None
+
+    async def _count_checked(self, rows) -> int:
+        checked = 0
+        for cb in rows:
+            for sel in self._box_selectors(cb):
+                try:
+                    loc = self._page.locator(sel).first
+                    if await loc.count() == 0:
+                        continue
+                    if await loc.is_checked():
+                        checked += 1
+                    break
+                except Exception:
+                    continue
+        return checked
+
+    @staticmethod
+    def _box_selectors(cb):
         selectors = []
         if cb.get("id"):
             selectors.append(f'input[type="checkbox"][id="{cb["id"]}"]')
@@ -837,7 +953,12 @@ class LADBSScraper:
             selectors.append(
                 f'input[type="checkbox"][name="{cb["name"]}"][value="{cb["value"]}"]')
         selectors.append(f'input[type="checkbox"][name="{cb["name"]}"]')
-        for sel in selectors:
+        return selectors
+
+        return self._dedupe(all_records)
+
+    async def _check_box(self, cb) -> bool:
+        for sel in self._box_selectors(cb):
             try:
                 loc = self._page.locator(sel).first
                 if await loc.count() == 0:

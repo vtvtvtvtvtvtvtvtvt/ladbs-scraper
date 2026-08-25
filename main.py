@@ -45,7 +45,9 @@ class ScrapeRequest(BaseModel):
     time_budget_seconds: Optional[float] = Field(default=None, ge=10, le=900)
     # "all" submits every matched parcel at once; "each" walks them one at a
     # time (slower, kept as a fallback).
-    parcel_mode: str = Field(default="all", pattern="^(all|each)$")
+    # auto: submit all address rows together and, when there are only a few,
+    # also walk them individually and merge. all: together only. each: walk only.
+    parcel_mode: str = Field(default="auto", pattern="^(auto|all|each)$")
     # Returns the raw results-grid and pager markup in diagnostics, for
     # diagnosing a parsing gap without a screenshot.
     debug: bool = False

@@ -92,6 +92,20 @@ RECORDS[WINDOW_LABEL_W] = {
         for j in range(6)]
 }
 
+CYPRESS_PARCELS = [
+    {"id": "chkAddress$c0", "dom_id": "chkAddress_c0", "label": "2100 ROWS AVE"},
+    {"id": "chkAddress$c1", "dom_id": "chkAddress_c1", "label": "2100 N ROWS AVE"},
+    {"id": "chkAddress$c2", "dom_id": "chkAddress_c2", "label": "2100 W ROWS AVE"},
+    {"id": "chkAddress$c3", "dom_id": "chkAddress_c3", "label": "2100 2120 ROWS AVE"},
+]
+for _i, _p in enumerate(CYPRESS_PARCELS):
+    RECORDS[_p["label"]] = {
+        1: [(f"{300 + _i * 10 + j}", "Building Permit", "Alteration",
+             "07/27/1960", f"1960LA{66334 + _i * 10 + j}",
+             "{cccccccc-dddd-eeee-ffff-%012d}" % (_i * 10 + j))
+            for j in range(4)]
+    }
+
 _counter = itertools.count(1)
 
 
@@ -329,8 +343,11 @@ class Handler(BaseHTTPRequestHandler):
                     # The address search returns every matching row.
                     ok, parcels = True, WINDOW_PARCELS
                 else:
-                    ok = (one("Address$txtAddressBegNo") == "2100"
-                          and street == "CYPRESS")
+                    if street == "ROWS" and one("Address$txtAddressBegNo") == "2100":
+                        ok, parcels = True, CYPRESS_PARCELS   # four address rows
+                    else:
+                        ok = (one("Address$txtAddressBegNo") == "2100"
+                              and street == "CYPRESS")
             if not ok:
                 return self._send(
                     "<html><body>No parcels matched your search.</body></html>", sid, is_new)
@@ -346,6 +363,8 @@ class Handler(BaseHTTPRequestHandler):
                 "</div>",
                 "<input type='checkbox' id='All' name='All'/> All "
                 "(Note: Historical addresses are in red text)",
+                # Wrap the grid in a layout table, as the real page does.
+                "<table id='pageLayout'><tr><td>"
                 "<table id='grdAddress'>"
                 "<tr><th>Select</th><th>Beg Nbr</th><th>End Nbr</th>"
                 "<th>Dir</th><th>Str Name</th><th>Str Type</th></tr>",
@@ -361,7 +380,7 @@ class Handler(BaseHTTPRequestHandler):
                     f"name='{p_['id']}' value='{p_['label']}'/></td>"
                     f"<td>{beg}</td><td></td><td>{direction}</td>"
                     f"<td>{str_name}</td><td>{str_type}</td></tr>")
-            boxes.append("</table>")
+            boxes.append("</table></td></tr></table>")
             boxes.append("<input type='submit' name='btnNext2' id='btnNext2' value='Continue'/>")
             action = f"{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
             return self._send(_page("".join(boxes), vs, action), sid, is_new)

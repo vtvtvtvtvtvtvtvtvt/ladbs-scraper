@@ -56,8 +56,10 @@ class TestCombinedSelection:
     def test_runs_one_search_not_one_per_parcel(self, combined):
         # The regression: 24 parcels meant 24 full searches.
         assert combined["_searches"] == 1
-        assert combined["diagnostics"]["parcel_mode"] == "all"
-        assert combined["diagnostics"]["parcels_selected"] == 24
+        # Too many rows to also walk them individually: combined submit only.
+        steps = [s["step"] for s in combined["diagnostics"]["strategy"]]
+        assert steps == ["combined"]
+        assert combined["diagnostics"]["address_rows_checked"] == 24
 
     def test_pages_through_the_merged_result_set(self, combined):
         assert combined["diagnostics"]["result_pages"] >= 5   # 120 rows / 25
