@@ -18,6 +18,11 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Railway injects the commit SHA of the build it is serving. Stamping it into
+# every response settles "is the fix actually deployed?" without guessing.
+SERVICE_VERSION = (os.environ.get("RAILWAY_GIT_COMMIT_SHA", "") or "dev")[:7]
+logger.info(f"LADBS scraper service version: {SERVICE_VERSION}")
+
 app = FastAPI(title="LADBS Scraper API", version="1.0.0")
 
 app.add_middleware(
@@ -54,7 +59,7 @@ class ScrapeRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": SERVICE_VERSION}
 
 def _log_if_empty(result: dict, identifier: str):
     """An empty result is usually a broken flow, not an empty parcel — say why."""
@@ -100,6 +105,7 @@ async def scrape(request: ScrapeRequest):
             address=request.address,
             include_details=request.include_details,
         )
+        result.setdefault("diagnostics", {})["service_version"] = SERVICE_VERSION
         _log_if_empty(result, identifier)
         return result
     except ValueError as e:
