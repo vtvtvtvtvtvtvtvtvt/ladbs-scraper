@@ -559,6 +559,8 @@ class LADBSScraper:
             "type": kind,
             "query": query,
             "address_rows": self._diag.pop("parcels", []),
+            # What each address row contributed on this leg.
+            "steps": self._diag.pop("strategy", []),
             "records": len(records),
         })
 
@@ -852,7 +854,9 @@ class LADBSScraper:
                 or (mode == "auto" and len(rows) <= FULL_WALK_MAX_ROWS))
 
         collected = []
-        self._diag["strategy"] = []
+        # Accumulate: a scrape can run more than one search, and resetting
+        # here threw away the earlier leg's breakdown.
+        self._diag.setdefault("strategy", [])
 
         if combine:
             self._step(f"submitting all {len(rows)} address row(s) together")

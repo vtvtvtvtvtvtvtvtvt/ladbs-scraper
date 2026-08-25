@@ -100,3 +100,24 @@ class TestStillWorksWithOneIdentifier:
         assert result["total_records"] == 6
         assert any("could not parse address" in w
                    for w in result["diagnostics"]["warnings"])
+
+
+class TestPerRowBreakdownSurvivesBothLegs:
+    """Each leg's per-row detail must reach the caller, not be overwritten."""
+
+    def test_each_leg_carries_its_own_steps(self, both):
+        for search in both["diagnostics"]["searches"]:
+            assert "steps" in search, f"{search['type']} leg lost its breakdown"
+
+    def test_the_address_leg_shows_what_each_row_gave(self, both):
+        address = next(s for s in both["diagnostics"]["searches"]
+                       if s["type"] == "address")
+        rows = [st for st in address["steps"] if st["step"] == "row"]
+        assert rows, "no per-row breakdown for the address leg"
+        assert all("records" in r and "row" in r for r in rows)
+
+    def test_row_counts_are_attributable(self, both):
+        address = next(s for s in both["diagnostics"]["searches"]
+                       if s["type"] == "address")
+        named = {st["row"] for st in address["steps"] if st["step"] == "row"}
+        assert any("W MUSEUM" in n for n in named)
