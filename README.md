@@ -33,6 +33,22 @@ gh repo create ladbs-scraper --public --push
 ### `GET /health`
 Returns `{"status": "ok"}` — use to confirm the service is running.
 
+### `GET /scrape` (browser-friendly)
+
+The same scrape as the POST, callable from a browser address bar:
+
+```
+/scrape?address=2100 Cypress Ave, Los Angeles, CA 90065
+/scrape?ain=5442004006&address=2100 Cypress Ave
+/scrape?address=...&format=full        # the complete POST response
+```
+
+The default `format=summary` returns the diagnosis in one screen: serving
+version, which address rows the selection page offered, how many were
+confirmed ticked, what each search leg and each row contributed, image counts
+and where each id came from, pages read vs advertised, and any warnings. Use
+it to inspect a live pull without curl or a client in the way.
+
 ### `POST /scrape`
 ```json
 {

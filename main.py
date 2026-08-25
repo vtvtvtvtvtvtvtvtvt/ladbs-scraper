@@ -114,6 +114,75 @@ async def scrape(request: ScrapeRequest):
         logger.error(f"Scrape failed for {identifier}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/scrape")
+async def scrape_get(
+    address: Optional[str] = Query(None),
+    ain: Optional[str] = Query(None),
+    include_details: bool = Query(True),
+    parcel_mode: str = Query("auto", pattern="^(auto|all|each)$"),
+    debug: bool = Query(False),
+    time_budget_seconds: Optional[float] = Query(None, ge=10, le=900),
+    format: str = Query("summary", pattern="^(summary|full)$"),
+):
+    """Browser-friendly scrape: open the URL, read the result.
+
+    Exists so a live run can be inspected without curl or a client in the
+    way — format=summary distills the fields that diagnose a bad pull.
+    """
+    request = ScrapeRequest(
+        address=address, ain=ain, include_details=include_details,
+        parcel_mode=parcel_mode, debug=debug,
+        time_budget_seconds=time_budget_seconds,
+    )
+    result = await scrape(request)
+    if format == "full":
+        return result
+
+    diag = result.get("diagnostics", {})
+    # Each search leg consumes the parcels list into its own entry; the
+    # address leg's is the full set the selection page offered.
+    rows_offered = diag.get("parcels")
+    for search in diag.get("searches", []):
+        if search.get("address_rows"):
+            rows_offered = search["address_rows"]
+    return {
+        "service_version": diag.get("service_version"),
+        "status": result.get("status"),
+        "total_records": result.get("total_records"),
+        "address_rows_offered": rows_offered,
+        "address_rows_checked": f"{diag.get('address_rows_checked')}"
+                                f"/{diag.get('address_rows_found')}",
+        "used_all_control": diag.get("used_all_control"),
+        "searches": [
+            {
+                "type": s.get("type"),
+                "query": s.get("query"),
+                "records": s.get("records"),
+                "address_rows": s.get("address_rows"),
+                "per_row": [
+                    {"row": st.get("row"), "records": st.get("records")}
+                    for st in s.get("steps", []) if st.get("step") == "row"
+                ],
+                "combined": next(
+                    (st.get("records") for st in s.get("steps", [])
+                     if st.get("step") == "combined"), None),
+            }
+            for s in diag.get("searches", [])
+        ],
+        "images": {
+            "rows_showing_icon": diag.get("rows_showing_image_icon"),
+            "records_with_image": diag.get("records_with_image"),
+            "from_grid": diag.get("image_ids_from_grid"),
+            "from_detail": diag.get("image_ids_from_detail"),
+        },
+        "pages": f"{diag.get('result_pages')}/{diag.get('pages_advertised')}",
+        "truncated": diag.get("truncated"),
+        "elapsed_seconds": diag.get("elapsed_seconds"),
+        "warnings": diag.get("warnings"),
+        "summary": result.get("summary"),
+    }
+
+
 @app.get("/fetch-image")
 async def fetch_image(url: str = Query(...)):
     logger.info(f"fetch-image: {url}")

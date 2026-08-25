@@ -121,3 +121,33 @@ class TestPerRowBreakdownSurvivesBothLegs:
                        if s["type"] == "address")
         named = {st["row"] for st in address["steps"] if st["step"] == "row"}
         assert any("W MUSEUM" in n for n in named)
+
+
+class TestBrowserGetEndpoint:
+    """GET /scrape exists so a live run can be inspected from a browser."""
+
+    def _get(self, params):
+        with MockLADBS() as mock:
+            old = scraper_mod.BASE_URL, scraper_mod.MAIN_URL
+            scraper_mod.BASE_URL = f"{mock.base}{IDIS}"
+            scraper_mod.MAIN_URL = mock.base
+            try:
+                return TestClient(main.app).get("/scrape", params=params)
+            finally:
+                scraper_mod.BASE_URL, scraper_mod.MAIN_URL = old
+
+    def test_summary_carries_the_diagnostic_fields(self):
+        body = self._get({"address": ADDRESS, "include_details": "false"}).json()
+        assert body["status"] == "ok"
+        assert body["total_records"] == 31
+        assert body["address_rows_offered"] == ["234 MUSEUM DR", "234 W MUSEUM DR"]
+        assert body["searches"][0]["per_row"], "per-row breakdown missing"
+        assert "service_version" in body
+
+    def test_full_format_returns_the_whole_response(self):
+        body = self._get({"ain": AIN, "include_details": "false",
+                          "format": "full"}).json()
+        assert "records" in body and "diagnostics" in body
+
+    def test_no_identifier_is_still_a_400(self):
+        assert self._get({}).status_code == 400
