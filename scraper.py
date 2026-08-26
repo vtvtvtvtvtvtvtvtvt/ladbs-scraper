@@ -29,10 +29,11 @@ SCRAPE_BUDGET_SECONDS = float(os.environ.get("SCRAPE_TIMEOUT_SECONDS", "150"))
 # to a fraction while staying polite enough not to trip upstream throttling.
 DETAIL_CONCURRENCY = int(os.environ.get("LADBS_DETAIL_CONCURRENCY", "6"))
 
-# With few address rows, submitting them together AND walking them one by one
-# costs little and guarantees nothing is missed if the site honours only the
-# first selection. Beyond this many rows the per-row walk is too expensive.
-FULL_WALK_MAX_ROWS = int(os.environ.get("LADBS_FULL_WALK_MAX_ROWS", "6"))
+# Walking rows one at a time is the only selection strategy the live site
+# honours: a combined multi-checkbox submit was observed returning 2 records
+# where the per-row walk returned 28. This caps how many rows one scrape will
+# walk; past it the result is returned partial rather than run forever.
+FULL_WALK_MAX_ROWS = int(os.environ.get("LADBS_FULL_WALK_MAX_ROWS", "30"))
 
 # Text that means the upstream refused us rather than "this parcel is empty".
 # An empty result caused by one of these is a failure and must be reported as
@@ -822,10 +823,14 @@ class LADBSScraper:
         self._diag["checkboxes_found"] = len(checkboxes)
         # Recorded here so it is reported whatever parcel_mode is in use.
         self._diag["parcels"] = [c.get("label") or c["name"] for c in checkboxes]
-        if len(checkboxes) <= 1:
-            # Fewer rows than a search usually offers: keep the grid markup so
-            # a missing address row can be seen rather than inferred.
-            self._diag["address_grid_sample"] = self._address_grid_sample(html)
+        self._diag["address_rows_found"] = len(checkboxes)
+        self._diag["selection_page"] = {
+            "checkboxes": [{"name": c["name"], "id": c.get("id", ""),
+                            "label": c.get("label", c.get("value", ""))}
+                           for c in checkboxes],
+            "sample": self._address_grid_sample(html),
+        }
+
         self._step(f"selection page has {len(checkboxes)} address row(s): "
                    f"{[c.get('label') or c['name'] for c in checkboxes]}")
 
@@ -840,61 +845,90 @@ class LADBSScraper:
         return self._dedupe(await self._gather(checkboxes, restart))
 
     async def _gather(self, rows, restart):
-        """Collect records for every matching address row.
+        """Collect records for every matching selection row.
 
-        "auto" (default) submits all rows together and, when there are only a
-        few, also walks them individually and merges — cheap insurance against
-        a site that honours just one selection. "all" submits together only;
-        "each" walks only.
+        Live LADBS honours one checkbox per submit: ticking several and
+        submitting once was observed to return a fraction of what the same
+        rows return walked individually. So "auto" (default) and "each" walk
+        every row; "all" keeps the single combined submit for explicit use,
+        falling back to the walk when it returns nothing.
         """
         mode = self.parcel_mode
-        combine = len(rows) > 1 and mode in ("auto", "all")
-        walk = (mode == "each"
-                or len(rows) == 1
-                or (mode == "auto" and len(rows) <= FULL_WALK_MAX_ROWS))
-
         collected = []
-        # Accumulate: a scrape can run more than one search, and resetting
-        # here threw away the earlier leg's breakdown.
         self._diag.setdefault("strategy", [])
+        self._diag["parcel_mode"] = mode
+        page_is_fresh = True
 
-        if combine:
-            self._step(f"submitting all {len(rows)} address row(s) together")
+        if mode == "all" and len(rows) > 1:
+            self._step(f"submitting all {len(rows)} row(s) together")
             found = await self._submit_rows(rows)
             self._diag["strategy"].append(
                 {"step": "combined", "rows": len(rows), "records": len(found)})
             collected.extend(found)
-            if not found:
-                self._warn("combined submit returned nothing; walking rows individually")
-                walk = True
+            if found:
+                return collected
+            self._warn("combined submit returned nothing; walking rows individually")
+            page_is_fresh = False
 
-        if walk:
-            page_is_fresh = not combine
-            found = await self._walk_rows(rows, restart, page_is_fresh)
-            collected.extend(found)
-
-        self._diag["parcel_mode"] = mode
+        walk = rows[:FULL_WALK_MAX_ROWS]
+        if len(rows) > len(walk):
+            self._diag["truncated"] = True
+            self._warn(f"walking the first {len(walk)} of {len(rows)} rows")
+        collected.extend(await self._walk_rows(walk, restart, page_is_fresh))
         return collected
 
-    async def _walk_rows(self, rows, restart, page_is_fresh):
+    async def _walk_rows(self, rows, reopen, page_is_fresh, depth=0, prefix=""):
+        """Select each row on its own and collect what it returns.
+
+        A selection can land on another selection page instead of results —
+        the address list leads to a per-parcel identifier list (assessor
+        number, address range, legal description). Those sub-rows are walked
+        too, re-selecting the parent row to get back to them each time.
+        """
         out = []
+        ticked = 0
         for idx, cb in enumerate(rows):
-            if self._out_of_time(f"stopped after {idx} of {len(rows)} address row(s)"):
+            if self._out_of_time(
+                    f"stopped after {idx} of {len(rows)} row(s){prefix}"):
                 break
             if idx > 0 or not page_is_fresh:
-                # Each selection needs a fresh, server-issued __VIEWSTATE.
-                await restart()
-            label = cb.get("label") or cb["name"]
-            self._step(f"selecting address {idx + 1}/{len(rows)}: {label}")
+                await reopen()
+            label = prefix + (cb.get("label") or cb["name"])
+            self._step(f"selecting {idx + 1}/{len(rows)}: {label}")
             if not await self._check_and_continue(cb):
                 continue
+            ticked += 1
             html = await self._page.content()
             self._capture_markup(html)
-            found = parse_results_html(html) + await self._paginate()
-            self._step(f"  {label} yielded {len(found)} record(s)")
-            self._diag["strategy"].append(
-                {"step": "row", "row": label, "records": len(found)})
-            out.extend(found)
+            found = parse_results_html(html)
+            if found:
+                found += await self._paginate()
+                self._step(f"  {label} yielded {len(found)} record(s)")
+                self._diag["strategy"].append(
+                    {"step": "row", "row": label, "records": len(found)})
+                out.extend(found)
+                continue
+
+            subrows = parse_checkboxes(html)
+            same_page = {c["name"] for c in subrows} == {c["name"] for c in rows}
+            if subrows and not same_page and depth < 2:
+                self._step(f"  {label} led to {len(subrows)} sub-selection(s)")
+                self._diag["strategy"].append(
+                    {"step": "sub_selection", "row": label, "rows": len(subrows)})
+
+                async def reopen_sub(parent=cb):
+                    await reopen()
+                    await self._check_and_continue(parent)
+
+                out.extend(await self._walk_rows(
+                    subrows, reopen_sub, page_is_fresh=True,
+                    depth=depth + 1, prefix=f"{label} > "))
+            else:
+                self._diag["strategy"].append(
+                    {"step": "row", "row": label, "records": 0})
+                self._warn(f"{label}: no results grid and no onward selection")
+        if depth == 0:
+            self._diag["address_rows_checked"] = ticked
         return out
 
     async def _submit_rows(self, rows):
@@ -1259,6 +1293,17 @@ class LADBSScraper:
                     rec.update(self._parse_detail_html(detail_html))
                     if not rec.get("has_digital_image"):
                         self._adopt_detail_image(rec, detail_html)
+                    if (rec.get("image_icon_in_row")
+                            and not rec.get("has_digital_image")
+                            and "detail_page_sample" not in self._diag):
+                        # The grid showed an icon and the record's own page
+                        # still yielded no id: keep that page's links as the
+                        # evidence the image parser is missing.
+                        self._diag["detail_page_sample"] = {
+                            "url": rec["detail_url"],
+                            "doc_number": rec.get("doc_number"),
+                            "links": self._page_links(detail_html),
+                        }
             except Exception as e:
                 rec["detail_error"] = str(e)
             finally:
@@ -1280,6 +1325,27 @@ class LADBSScraper:
         self._diag["details_fetched"] = True
         self._diag["detail_failures"] = failed
         self._step(f"details done: {len(records) - failed} ok, {failed} failed/skipped")
+
+    @staticmethod
+    def _page_links(html, cap=3500):
+        """Every anchor and scripted link on a page, bounded."""
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        for el in soup.find_all(True):
+            for attr in ("href", "onclick", "src"):
+                value = el.get(attr)
+                if isinstance(value, str) and value not in ("", "#"):
+                    text = el.get_text(" ", strip=True)[:60]
+                    links.append(f"{attr}={value[:220]} [{text}]")
+        out = []
+        used = 0
+        for link in links:
+            if used + len(link) > cap:
+                out.append(f"... {len(links) - len(out)} more link(s) elided")
+                break
+            out.append(link)
+            used += len(link)
+        return out
 
     @staticmethod
     def _adopt_detail_image(rec, detail_html):

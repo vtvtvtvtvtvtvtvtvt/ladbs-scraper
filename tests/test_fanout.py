@@ -40,7 +40,7 @@ def scrape(value, by="ain", **kwargs):
 
 @pytest.fixture(scope="module")
 def combined():
-    return scrape(FAN_AIN)
+    return scrape(FAN_AIN, parcel_mode="all")
 
 
 @pytest.fixture(scope="module")
@@ -49,14 +49,14 @@ def per_parcel():
 
 
 class TestCombinedSelection:
+    """parcel_mode="all": one submit — fast where the site honours it."""
+
     def test_returns_every_parcels_records(self, combined):
         assert combined["total_records"] == 120
         assert combined["status"] == "ok"
 
     def test_runs_one_search_not_one_per_parcel(self, combined):
-        # The regression: 24 parcels meant 24 full searches.
         assert combined["_searches"] == 1
-        # Too many rows to also walk them individually: combined submit only.
         steps = [s["step"] for s in combined["diagnostics"]["strategy"]]
         assert steps == ["combined"]
         assert combined["diagnostics"]["address_rows_checked"] == 24
@@ -82,8 +82,8 @@ class TestAgainstPerParcelWalk:
 
 
 class TestFanoutByAddress:
-    def test_address_search_also_uses_one_submit(self):
-        result = scrape(FAN_ADDRESS, by="address")
+    def test_address_search_supports_combined_mode_too(self):
+        result = scrape(FAN_ADDRESS, by="address", parcel_mode="all")
         assert result["total_records"] == 120
         assert result["_searches"] == 1
 

@@ -115,6 +115,22 @@ RECORDS[ICON_LABEL] = {
         for j in range(8)]
 }
 
+# A search whose address rows lead to a second selection page (parcel
+# identifiers: assessor number / address range), as live LADBS does.
+TWO_LEVEL_PARCELS = [
+    {"id": "chkAddress$t0", "dom_id": "chkAddress_t0", "label": "7100 TWOSTEP AVE"},
+    {"id": "chkAddress$t1", "dom_id": "chkAddress_t1", "label": "7100 N TWOSTEP AVE"},
+]
+TWO_LEVEL_LABELS = {p["label"] for p in TWO_LEVEL_PARCELS}
+for _p in TWO_LEVEL_PARCELS:
+    _lb = _p["label"]
+    RECORDS[f"AS {_lb}"] = {1: [
+        (f"{500 + hash(_lb) % 50 + j}", "Building Permit", "New", "01/01/2000",
+         f"AS-{_lb[:6]}-{j}", "") for j in range(2)]}
+    RECORDS[f"AR {_lb}"] = {1: [
+        (f"{560 + hash(_lb) % 50 + j}", "Building Permit", "Alteration",
+         "02/02/2001", f"AR-{_lb[:6]}-{j}", "") for j in range(3)]}
+
 _counter = itertools.count(1)
 
 
@@ -347,6 +363,8 @@ class Handler(BaseHTTPRequestHandler):
                     # Like the real site: the assessor lookup surfaces only
                     # the directional address row, not its sibling.
                     ok, parcels = True, WINDOW_PARCELS[1:]
+                elif ain == ("7100", "100", "100"):      # two-level selection
+                    ok, parcels = True, TWO_LEVEL_PARCELS
                 elif ain == ("9000", "000", "000"):      # ids only on detail pages
                     ok, parcels = True, ICON_PARCELS
                 elif ain == ("5468", "018", "015"):      # 5 pages, windowed pager
@@ -410,13 +428,34 @@ class Handler(BaseHTTPRequestHandler):
             action = f"{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
             return self._send(_page("".join(boxes), vs, action), sid, is_new)
 
-        # Step 2 -> results for the selected parcel
+        # Step 2 -> results, or a second selection page for two-level parcels
         if "btnNext2" in form:
+            idents = [v for k, vals in form.items()
+                      if k.startswith("chkIdent") for v in vals]
+            if idents:
+                STATE.searched.add(sid)
+                return self._send(_results_page(idents, 1, vs), sid, is_new)
+
             selected = [v for k, vals in form.items()
                         if k.startswith("chkAddress") for v in vals]
             if not selected:
                 return self._send(
                     "<html><body>Please select a parcel.</body></html>", sid, is_new)
+
+            if all(v in TWO_LEVEL_LABELS for v in selected):
+                # Identifier page: plain checkboxes, no address grid.
+                lb = selected[0]
+                body = (
+                    "Please choose from the following to limit your search<br/>"
+                    f"<input type='checkbox' id='chkIdent_0' name='chkIdent$0' "
+                    f"value='AS {lb}'/> AS {lb}<br/>"
+                    f"<input type='checkbox' id='chkIdent_1' name='chkIdent$1' "
+                    f"value='AR {lb}'/> AR {lb}<br/>"
+                    "<input type='submit' name='btnNext2' id='btnNext2' "
+                    "value='Continue'/>")
+                action = f"{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
+                return self._send(_page(body, vs, action), sid, is_new)
+
             STATE.searched.add(sid)
             return self._send(_results_page(selected, 1, vs), sid, is_new)
 

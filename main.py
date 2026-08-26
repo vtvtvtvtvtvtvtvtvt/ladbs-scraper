@@ -180,6 +180,12 @@ async def scrape_get(
         "elapsed_seconds": diag.get("elapsed_seconds"),
         "warnings": diag.get("warnings"),
         "summary": result.get("summary"),
+        # Raw evidence for the parsing gaps, captured automatically.
+        "evidence": {
+            "selection_page": diag.get("selection_page"),
+            "image_row_sample": diag.get("image_row_sample"),
+            "detail_page_sample": diag.get("detail_page_sample"),
+        },
     }
 
 

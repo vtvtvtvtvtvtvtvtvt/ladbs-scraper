@@ -245,11 +245,11 @@ class TestDiagnosticsAreReportedInEveryMode:
         # Page counts are the most-disputed number; keep the evidence.
         assert "pnlNavigate" in windowed["diagnostics"]["pager_html"]
 
-    def test_a_lone_address_row_keeps_the_grid_markup(self):
-        # One row where a search usually offers several is worth seeing.
+    def test_selection_page_markup_is_always_kept(self):
         diag = scrape(PAGER_AIN)["diagnostics"]
         assert diag["checkboxes_found"] == 1
-        assert diag["address_grid_sample"]
+        assert diag["selection_page"]["sample"]
+        assert len(diag["selection_page"]["checkboxes"]) == 1
 
 
 class TestUnresolvedImageEvidence:

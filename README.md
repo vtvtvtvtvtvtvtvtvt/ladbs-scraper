@@ -77,9 +77,15 @@ are handled. A search for "2100 Cypress" offers four — plain, `N`, `W`, and a
 
 | mode | behaviour |
 | --- | --- |
-| `auto` | Submits every row together via the page's "All" control and, when there are at most `LADBS_FULL_WALK_MAX_ROWS` (6) rows, also walks them individually and merges. Cheap insurance if the site honours only one selection. |
-| `all` | One combined submit only. Use for an address matching dozens of rows, where the per-row walk is too slow. |
-| `each` | One search per row. Thorough, slowest. |
+| `auto` (default) | Walks every row individually — up to `LADBS_FULL_WALK_MAX_ROWS` (30) — and merges, deduplicated. Live LADBS honours one checkbox per submit, so this is the only strategy that returns everything. |
+| `each` | Same walk, kept as an explicit alias. |
+| `all` | One combined multi-checkbox submit. **Observed returning a fraction of the records on live LADBS** (2 where the walk returned 28); falls back to the walk when it returns nothing. Experimental only. |
+
+A selection can also lead to a *second* selection page — live LADBS resolves a
+search to a parcel and then offers that parcel's identifiers (assessor number,
+address range, legal description) as another round of checkboxes. Every level
+is walked, and `diagnostics.strategy` labels sub-rows through their parent
+(`"7100 TWOSTEP AVE > AS ..."`).
 
 `diagnostics.address_rows_found` and `address_rows_checked` report how many
 rows the page offered and how many were confirmed ticked — read back from the

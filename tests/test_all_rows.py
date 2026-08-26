@@ -96,8 +96,11 @@ class TestSelectionIsVerified:
         assert diag["address_rows_found"] == diag["address_rows_checked"]
         assert diag["address_rows_checked"] > 1
 
-    def test_the_pages_all_control_is_used(self, auto):
-        assert auto["diagnostics"]["used_all_control"] is True
+    def test_the_pages_all_control_is_used_by_combined_mode(self):
+        # Only the explicit combined mode drives the page's All checkbox;
+        # the default walks rows one at a time, which is what live LADBS honours.
+        result = scrape(parcel_mode="all")
+        assert result["diagnostics"]["used_all_control"] is True
 
     def test_every_row_contributes(self, auto):
         rows_walked = [s for s in auto["diagnostics"]["strategy"]
@@ -121,9 +124,12 @@ class TestModes:
         steps = [s["step"] for s in result["diagnostics"]["strategy"]]
         assert steps == ["combined"]
 
-    def test_auto_does_both_when_rows_are_few(self, auto):
+    def test_auto_walks_only(self, auto):
+        # A combined multi-checkbox submit returns a fraction of the records
+        # on live LADBS, so auto never uses it.
         steps = [s["step"] for s in auto["diagnostics"]["strategy"]]
-        assert "combined" in steps and "row" in steps
+        assert "combined" not in steps
+        assert steps.count("row") == 4
 
     def test_all_modes_find_the_same_records(self, auto):
         each = scrape(parcel_mode="each")
