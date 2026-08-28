@@ -289,6 +289,13 @@ carries "Display Fields" checkboxes (All Fields, Frac, Unit, Zip Code) and an
 `Select` / `Beg Nbr` / `Str Name` column headings so those controls are never
 submitted as if they were parcels.
 
+**A hidden icon is not an image.** LADBS renders the image-icon element on
+every result row and hides it with CSS (`visibility:hidden`) when the record
+has no digital image. Only visible icons are counted, so
+`rows_showing_image_icon` matches what a person sees on the page — when it
+equals `records_with_image`, extraction is complete and the parcel genuinely
+has that many imaged documents.
+
 **Image links need `include_details: true`.** Most result rows show an image
 icon but carry no document id in the grid — the id is on the record's own
 `Report.aspx` page, which is only fetched when details are on. With details off

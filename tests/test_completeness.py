@@ -281,3 +281,40 @@ class TestUnresolvedImageEvidence:
     def test_no_grid_is_safe(self):
         from scraper import unresolved_image_row
         assert unresolved_image_row("<html><body>nothing</body></html>") is None
+
+
+class TestHiddenIconsAreNotCounted:
+    """LADBS renders a CSS-hidden icon on rows with no image; a hidden icon is
+    not a claim that an image exists — counting it produced a false '15 icons,
+    4 ids' alarm on a parcel whose true visible-icon count was 4."""
+
+    def _row(self, html):
+        return BeautifulSoup(f"<table><tr>{html}</tr></table>",
+                             "html.parser").find("tr")
+
+    def test_visible_icon_counts(self):
+        assert row_has_image_icon(self._row(
+            "<td><img src='images/image.gif' alt='View digital image'/></td>"))
+
+    def test_icon_hidden_on_itself_does_not_count(self):
+        assert not row_has_image_icon(self._row(
+            "<td><img src='images/image.gif' alt='View digital image' "
+            "style='VISIBILITY: Hidden'/></td>"))
+
+    def test_icon_inside_hidden_anchor_does_not_count(self):
+        # The exact shape live LADBS renders on imageless rows.
+        assert not row_has_image_icon(self._row(
+            "<td><a style=\"visibility:hidden\"> "
+            "<img src='images/image.gif' alt='View digital image'/></a></td>"))
+
+    def test_display_none_ancestor_does_not_count(self):
+        assert not row_has_image_icon(self._row(
+            "<td style='display:none'><img src='images/image.gif' "
+            "alt='View digital image'/></td>"))
+
+    def test_icon_and_id_counts_agree_on_the_mock_parcel(self, windowed):
+        diag = windowed["diagnostics"]
+        assert (diag["rows_showing_image_icon"]
+                == diag["records_with_image"] == 20)
+        assert not any("image extraction is incomplete" in w
+                       for w in diag["warnings"])

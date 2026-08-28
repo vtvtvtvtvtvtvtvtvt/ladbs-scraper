@@ -232,13 +232,34 @@ def row_image_guids(row, primary_guid: str) -> list:
     return guids
 
 
+def _element_hidden(el) -> bool:
+    style = (el.get("style") or "").lower().replace(" ", "")
+    return "visibility:hidden" in style or "display:none" in style
+
+
 def row_has_image_icon(row) -> bool:
-    """Does the row show an image/camera icon, whatever the links say?"""
+    """Does the row VISIBLY show an image icon?
+
+    LADBS renders the icon element on every row and hides it with CSS when the
+    record has no digital image — counting icons in the markup instead of
+    icons a person can see reported 15 where the page shows 4.
+    """
     for img in row.find_all("img"):
         src = (img.get("src") or "").lower()
         alt = (img.get("alt") or "").lower()
-        if any(w in src or w in alt
-               for w in ("image", "camera", "doc", "pdf", "view", "tif")):
+        if not any(w in src or w in alt
+                   for w in ("image", "camera", "doc", "pdf", "view", "tif")):
+            continue
+        if _element_hidden(img):
+            continue
+        ancestor = img.parent
+        hidden = False
+        while ancestor is not None and ancestor is not row:
+            if _element_hidden(ancestor):
+                hidden = True
+                break
+            ancestor = ancestor.parent
+        if not hidden:
             return True
     return False
 

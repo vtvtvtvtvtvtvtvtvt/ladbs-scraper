@@ -194,7 +194,9 @@ def _results_page(labels, page_no, viewstate):
             icon = (f"<a href=\"javascript:OpenImage('{guid}')\">"
                     f"<img src='/images/camera.gif' alt='Digital Image'/></a>")
         else:
-            icon = ""
+            # As live LADBS does: the icon element exists but is CSS-hidden.
+            icon = ("<a style='visibility:hidden'><img src='/images/image.gif' "
+                    "alt='View digital image' style='VISIBILITY: Hidden'/></a>")
         rows.append(
             f"<tr><td>{i+1}{icon}</td>"
             f"<td><a href=\"javascript:OpenWindow('{rid}','{vis}','{real_guid}')\">{dtype}</a></td>"
