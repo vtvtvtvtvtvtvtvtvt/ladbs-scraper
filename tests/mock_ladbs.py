@@ -131,6 +131,19 @@ for _p in TWO_LEVEL_PARCELS:
         (f"{560 + hash(_lb) % 50 + j}", "Building Permit", "Alteration",
          "02/02/2001", f"AR-{_lb[:6]}-{j}", "") for j in range(3)]}
 
+# A street where the direction decides which parcel the search resolves to,
+# as live LADBS does: a direction-less search reaches only one address record.
+VARIANT_SHARED = [{"id": "chkAddress$v0", "dom_id": "chkAddress_v0",
+                   "label": "4000 VARIANT AVE"}]
+VARIANT_NORTH = [{"id": "chkAddress$v1", "dom_id": "chkAddress_v1",
+                  "label": "4000 N VARIANT AVE"}]
+RECORDS["4000 VARIANT AVE"] = {1: [
+    (f"{700 + j}", "Building Permit", "New", "03/03/1990",
+     f"1990LA{70000 + j}", "") for j in range(2)]}
+RECORDS["4000 N VARIANT AVE"] = {1: [
+    (f"{710 + j}", "Building Permit", "Alteration", "04/04/1991",
+     f"1991LA{71000 + j}", "") for j in range(2)]}
+
 _counter = itertools.count(1)
 
 
@@ -382,7 +395,16 @@ class Handler(BaseHTTPRequestHandler):
                     ok = ain == ("5443", "016", "018")
             else:
                 street = one("Address$txtAddressStreetName").upper()
-                if street == "FANOUT":
+                if street == "VARIANT" and one("Address$txtAddressBegNo") == "4000":
+                    direction = one("Address$txtAddressDirection").upper().strip()
+                    if direction in ("", "W"):
+                        # Blank and W resolve to the same parcel.
+                        ok, parcels = True, VARIANT_SHARED
+                    elif direction == "N":
+                        ok, parcels = True, VARIANT_NORTH
+                    else:
+                        ok = False
+                elif street == "FANOUT":
                     ok, parcels = True, FAN_PARCELS
                 elif street == "MUSEUM" and one("Address$txtAddressBegNo") == "234":
                     # The address search returns every matching row.

@@ -56,6 +56,11 @@ class ScrapeRequest(BaseModel):
     # Returns the raw results-grid and pager markup in diagnostics, for
     # diagnosing a parsing gap without a screenshot.
     debug: bool = False
+    # Also search the address with each directional prefix (N/S/E/W and none):
+    # 2100, 2100 N and 2100 W Cypress are separate address records, and a
+    # direction-less search reaches only one of them. Variants resolving to an
+    # already-searched parcel are skipped, so the cost is a few quick lookups.
+    expand_directions: bool = True
 
 @app.get("/health")
 def health():
@@ -104,6 +109,7 @@ async def scrape(request: ScrapeRequest):
             ain=request.ain,
             address=request.address,
             include_details=request.include_details,
+            expand_directions=request.expand_directions,
         )
         result.setdefault("diagnostics", {})["service_version"] = SERVICE_VERSION
         _log_if_empty(result, identifier)
@@ -122,6 +128,7 @@ async def scrape_get(
     parcel_mode: str = Query("auto", pattern="^(auto|all|each)$"),
     debug: bool = Query(False),
     time_budget_seconds: Optional[float] = Query(None, ge=10, le=900),
+    expand_directions: bool = Query(True),
     format: str = Query("summary", pattern="^(summary|full)$"),
 ):
     """Browser-friendly scrape: open the URL, read the result.
@@ -133,6 +140,7 @@ async def scrape_get(
         address=address, ain=ain, include_details=include_details,
         parcel_mode=parcel_mode, debug=debug,
         time_budget_seconds=time_budget_seconds,
+        expand_directions=expand_directions,
     )
     result = await scrape(request)
     if format == "full":

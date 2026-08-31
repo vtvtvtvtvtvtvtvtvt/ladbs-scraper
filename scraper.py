@@ -515,7 +515,8 @@ class LADBSScraper:
         return await self._run(worker)
 
     async def scrape_all(self, ain: str = None, address: str = None,
-                         include_details: bool = True) -> dict:
+                         include_details: bool = True,
+                         expand_directions: bool = True) -> dict:
         """Search by every identifier given, in one session, and merge.
 
         An AIN resolves to one assessor parcel, but LADBS files documents
@@ -557,6 +558,30 @@ class LADBSScraper:
                             number, street_name, direction))
                     self._note_search("address", address, found)
                     collected.extend(found)
+
+                    if expand_directions:
+                        # The same street number can exist with and without a
+                        # directional prefix — 2100, 2100 N and 2100 W Cypress
+                        # are separate address records, and a search without
+                        # the direction resolves to just one of them. Search
+                        # each direction outright; a miss returns quickly, a
+                        # variant that lands on an already-walked parcel is
+                        # skipped, and anything new is merged in.
+                        for variant in ("", "N", "S", "E", "W"):
+                            if variant == direction:
+                                continue    # the base search covered this one
+                            if self._time_left() < 20:
+                                self._diag["truncated"] = True
+                                self._warn("time budget low; remaining "
+                                           "direction variants skipped")
+                                break
+                            label = f"{number} {variant} {street_name}".replace(
+                                "  ", " ").strip()
+                            found = await self._collect_records(
+                                lambda v=variant: self._start_address_search(
+                                    number, street_name, v))
+                            self._note_search("address_variant", label, found)
+                            collected.extend(found)
 
             merged = self._dedupe(collected)
             self._step(f"merged {len(collected)} record(s) from "
@@ -619,6 +644,7 @@ class LADBSScraper:
             context = await browser.new_context(user_agent=USER_AGENT)
             context.set_default_timeout(NAV_TIMEOUT)
             self._context = context
+            self._walked_selections = set()
             self._page = await context.new_page()
             try:
                 return await worker()
@@ -841,16 +867,28 @@ class LADBSScraper:
             return self._dedupe(records)
 
         checkboxes = parse_checkboxes(html)
+        if checkboxes:
+            signature = tuple(sorted(
+                (c["name"], c.get("value", "")) for c in checkboxes))
+            if signature in self._walked_selections:
+                self._step("this search resolved to a selection already walked "
+                           "by an earlier leg; skipping the repeat")
+                self._diag.setdefault("strategy", []).append(
+                    {"step": "duplicate_parcel",
+                     "rows": len(checkboxes)})
+                return []
+            self._walked_selections.add(signature)
         self._diag["checkboxes_found"] = len(checkboxes)
         # Recorded here so it is reported whatever parcel_mode is in use.
         self._diag["parcels"] = [c.get("label") or c["name"] for c in checkboxes]
         self._diag["address_rows_found"] = len(checkboxes)
-        self._diag["selection_page"] = {
-            "checkboxes": [{"name": c["name"], "id": c.get("id", ""),
-                            "label": c.get("label", c.get("value", ""))}
-                           for c in checkboxes],
-            "sample": self._address_grid_sample(html),
-        }
+        if checkboxes or "selection_page" not in self._diag:
+            self._diag["selection_page"] = {
+                "checkboxes": [{"name": c["name"], "id": c.get("id", ""),
+                                "label": c.get("label", c.get("value", ""))}
+                               for c in checkboxes],
+                "sample": self._address_grid_sample(html),
+            }
 
         self._step(f"selection page has {len(checkboxes)} address row(s): "
                    f"{[c.get('label') or c['name'] for c in checkboxes]}")

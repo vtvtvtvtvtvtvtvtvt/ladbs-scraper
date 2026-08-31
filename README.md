@@ -277,6 +277,16 @@ passes an AIN where an address is expected still gets results.
 timeout **above** this value — otherwise the client aborts a request the
 service was about to answer, and you lose records that were already collected.
 
+**Direction variants:** the same street number can exist with and without a
+directional prefix — `2100 CYPRESS`, `2100 N CYPRESS` and `2100 W CYPRESS` are
+separate address records that can belong to separate parcels, and a
+direction-less search resolves to only one of them. By default
+(`expand_directions: true`) the scraper re-runs the search with each prefix
+(N/S/E/W and none) and merges the results; a variant that resolves to a parcel
+already walked by an earlier leg is recognised and skipped, and a miss returns
+in seconds. Each variant appears in `diagnostics.searches` as
+`address_variant` with its own contribution.
+
 **AIN vs address:** an AIN alone can return a fraction of a property's
 documents. Send both identifiers whenever you have them.
 
