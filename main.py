@@ -190,6 +190,8 @@ async def scrape_get(
         "summary": result.get("summary"),
         # Raw evidence for the parsing gaps, captured automatically.
         "evidence": {
+            "frames": diag.get("frames"),
+            "post_search_page": diag.get("post_search_page"),
             "selection_page": diag.get("selection_page"),
             "image_row_sample": diag.get("image_row_sample"),
             "detail_page_sample": diag.get("detail_page_sample"),

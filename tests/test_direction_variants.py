@@ -87,3 +87,19 @@ class TestExpansionRespectsInputs:
                        "expand_directions": False})
         kinds = [s["type"] for s in result["diagnostics"]["searches"]]
         assert kinds == ["address"]
+
+
+class TestPostSearchInventory:
+    def test_debug_captures_the_page_as_received(self):
+        result = call({"address": ADDRESS, "include_details": False,
+                       "expand_directions": False, "debug": True})
+        page = result["diagnostics"]["post_search_page"]
+        assert page["url"]
+        assert any("chkAddress" in i for i in page["inputs"])
+        assert page["html_sample"]
+        assert page["iframes"] == []
+
+    def test_no_capture_without_debug(self):
+        result = call({"address": ADDRESS, "include_details": False,
+                       "expand_directions": False})
+        assert "post_search_page" not in result["diagnostics"]

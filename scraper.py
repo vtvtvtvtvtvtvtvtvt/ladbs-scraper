@@ -664,6 +664,63 @@ class LADBSScraper:
         boxes = soup.find_all("input", {"type": "checkbox"})
         return " ".join(str(b.parent)[:300] for b in boxes[:8])[:2500] or None
 
+    async def _inspect_frames(self, main_html):
+        """Notice content living outside the main frame.
+
+        page.content() reads only the main frame. If LADBS renders its address
+        grid inside an iframe, every parse of the "page" misses it while a
+        person sees it plainly — the difference between the browser's view and
+        the scraper's that nothing else explains.
+        """
+        try:
+            frames = self._page.frames
+        except Exception:
+            return
+        if len(frames) <= 1:
+            return
+        report = []
+        for frame in frames:
+            try:
+                html = main_html if frame is self._page.main_frame \
+                    else await frame.content()
+            except Exception:
+                continue
+            boxes = parse_checkboxes(html)
+            report.append({
+                "url": frame.url,
+                "is_main": frame is self._page.main_frame,
+                "checkboxes": len(boxes),
+                "checkbox_names": [c["name"] for c in boxes][:8],
+                "results_grid": "grdIdisResult" in html,
+            })
+        self._diag["frames"] = report
+        main_boxes = parse_checkboxes(main_html)
+        hidden_elsewhere = any(
+            not f["is_main"] and (f["checkboxes"] or f["results_grid"])
+            for f in report)
+        if hidden_elsewhere and not main_boxes:
+            self._warn("selection content is inside a child frame the scraper "
+                       "does not drive yet — this is where the missing "
+                       "address rows are")
+
+    def _page_inventory(self, html):
+        """The page as the scraper received it, for comparing against what a
+        person sees on screen."""
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        return {
+            "url": self._page.url,
+            "title": soup.title.get_text(strip=True) if soup.title else "",
+            "inputs": [f"{el.get('type', el.name)}:"
+                       f"{el.get('name') or el.get('id') or '?'}"
+                       for el in soup.find_all(["input", "select"])][:60],
+            "tables": [t.get("id") or f"(unnamed, {len(t.find_all('tr'))} rows)"
+                       for t in soup.find_all("table")][:40],
+            "iframes": [f.get("src", "") for f in soup.find_all(["iframe", "frame"])],
+            "html_sample": (str(soup.body) if soup.body else str(soup))[:9000],
+        }
+
     def _capture_markup(self, html):
         """Keep the markup behind any result that does not add up."""
         soup = BeautifulSoup(html, "html.parser")
@@ -859,6 +916,9 @@ class LADBSScraper:
         """Run the search, then walk every parcel selection the site offers."""
         await restart()
         html = await self._page.content()
+        await self._inspect_frames(html)
+        if self.debug and "post_search_page" not in self._diag:
+            self._diag["post_search_page"] = self._page_inventory(html)
 
         direct = parse_results_html(html)
         if direct:
