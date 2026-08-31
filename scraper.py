@@ -24,6 +24,24 @@ MAX_RESULT_PAGES = 25
 # as truncated, rather than letting the caller time out with nothing.
 SCRAPE_BUDGET_SECONDS = float(os.environ.get("SCRAPE_TIMEOUT_SECONDS", "150"))
 
+# ParcelSearch.aspx runs CheckResult() on load, which fast-forwards past the
+# "1st intermediate screen" — the page listing every matching address row —
+# by pre-answering it with the primary address. A person sees that screen; the
+# scraper never did. This trap makes the page's own assignment of CheckResult
+# a no-op, so the flow freezes on the address list and every row is walkable.
+FREEZE_ADDRESS_SCREEN_JS = """
+(() => {
+  const noop = function () {};
+  try {
+    Object.defineProperty(window, 'CheckResult', {
+      configurable: false,
+      get() { return noop; },
+      set(_) {},
+    });
+  } catch (e) {}
+})();
+"""
+
 # Detail pages are independent GETs, and a busy parcel has hundreds of them.
 # Fetched one at a time they dominate the whole scrape; a small pool cuts that
 # to a fraction while staying polite enough not to trip upstream throttling.
@@ -559,6 +577,18 @@ class LADBSScraper:
                     self._note_search("address", address, found)
                     collected.extend(found)
 
+                    if expand_directions and self._time_left() > 25:
+                        # A second pass with the auto-advance neutered, so the
+                        # address-choice screen stays put and every row on it
+                        # is walked — the rows the fast-forward skips.
+                        found = await self._frozen_grid_leg(
+                            number, street_name, direction)
+                        self._note_search(
+                            "address_grid",
+                            f"{number} {street_name} (choice screen held)",
+                            found)
+                        collected.extend(found)
+
                     if expand_directions:
                         # The same street number can exist with and without a
                         # directional prefix — 2100, 2100 N and 2100 W Cypress
@@ -599,6 +629,26 @@ class LADBSScraper:
             return result
 
         return await self._run(worker)
+
+    async def _frozen_grid_leg(self, number, street_name, direction):
+        """Search again on a page where the auto-advance cannot run."""
+        frozen = await self._context.new_page()
+        await frozen.add_init_script(FREEZE_ADDRESS_SCREEN_JS)
+        previous = self._page
+        self._page = frozen
+        try:
+            return await self._collect_records(
+                lambda: self._start_address_search(
+                    number, street_name, direction))
+        except Exception as e:
+            self._warn(f"held-screen pass failed: {e}")
+            return []
+        finally:
+            self._page = previous
+            try:
+                await frozen.close()
+            except Exception:
+                pass
 
     def _note_search(self, kind, query, records):
         """Record what one search contributed, so a thin result is traceable."""
@@ -707,10 +757,18 @@ class LADBSScraper:
         """The page as the scraper received it, for comparing against what a
         person sees on screen."""
         soup = BeautifulSoup(html, "html.parser")
+        scripts = " ".join(
+            sc.get_text() for sc in soup.find_all("script")
+            if "CheckResult" in sc.get_text())[:3500]
+        search_links = sorted({
+            a["href"] for a in soup.find_all("a", href=True)
+            if "SearchType" in a["href"]})[:12]
         for tag in soup(["script", "style"]):
             tag.decompose()
         return {
             "url": self._page.url,
+            "check_result_script": scripts or None,
+            "search_type_links": search_links,
             "title": soup.title.get_text(strip=True) if soup.title else "",
             "inputs": [f"{el.get('type', el.name)}:"
                        f"{el.get('name') or el.get('id') or '?'}"

@@ -277,6 +277,14 @@ passes an AIN where an address is expected still gets results.
 timeout **above** this value — otherwise the client aborts a request the
 service was about to answer, and you lose records that were already collected.
 
+**The held-screen pass:** ParcelSearch runs a `CheckResult()` script on load
+that fast-forwards past the address-choice screen ("1st intermediate screen"),
+pre-answering it with the parcel's primary address — which is why a person
+sees a list of matching addresses and the scraper historically never did.
+Alongside the normal search, a second pass runs in a page where that function
+is neutered, so the choice screen holds still and every address row on it is
+walked. It reports as `address_grid` in `diagnostics.searches`.
+
 **Direction variants:** the same street number can exist with and without a
 directional prefix — `2100 CYPRESS`, `2100 N CYPRESS` and `2100 W CYPRESS` are
 separate address records that can belong to separate parcels, and a

@@ -144,6 +144,52 @@ RECORDS["4000 N VARIANT AVE"] = {1: [
     (f"{710 + j}", "Building Permit", "Alteration", "04/04/1991",
      f"1991LA{71000 + j}", "") for j in range(2)]}
 
+# A street whose selection page auto-advances via CheckResult(), as live
+# LADBS does: script picks the W row and submits before a scraper can look.
+FROZEN_L1 = [
+    {"id": "chkAddress$f0", "dom_id": "chkAddress_f0", "label": "5000 FROZEN AVE"},
+    {"id": "chkAddress$f1", "dom_id": "chkAddress_f1", "label": "5000 W FROZEN AVE"},
+]
+RECORDS["5000 FROZEN AVE"] = {1: [
+    (f"{800 + j}", "Building Permit", "New", "05/05/1983",
+     f"1983LA{80000 + j}", "{aaaa0000-1111-2222-3333-%012d}" % j)
+    for j in range(2)]}
+RECORDS["5000 W FROZEN AVE"] = {1: [
+    (f"{810 + j}", "Building Permit", "Alteration", "06/06/1984",
+     f"1984LA{81000 + j}", "") for j in range(2)]}
+
+
+def _frozen_choice_page(viewstate):
+    """The address-choice screen, with the auto-advance the live site runs."""
+    action = f"{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
+    rows = []
+    for p in FROZEN_L1:
+        direction = "W" if " W " in f" {p['label']} " else ""
+        rows.append(
+            f"<tr><td><input type='checkbox' id='{p['dom_id']}' "
+            f"name='{p['id']}' value='{p['label']}'/></td>"
+            f"<td>{p['label'].split()[0]}</td><td></td>"
+            f"<td>{direction}</td><td>FROZEN</td><td>AVE</td></tr>")
+    return (
+        "<html><head><script>"
+        "function CheckResult() { document.getElementById('skipForm').submit(); }"
+        "</script></head>"
+        '<body onload="CheckResult();">'
+        f'<form id="mainform" method="post" action="{action}">'
+        f'<input type="hidden" name="__VIEWSTATE" value="{viewstate}"/>'
+        "<table><tr><th>Select</th><th>Beg Nbr</th><th>End Nbr</th>"
+        "<th>Dir</th><th>Str Name</th><th>Str Type</th></tr>"
+        + "".join(rows) +
+        "</table>"
+        '<input type="submit" name="btnNext2" id="btnNext2" value="Continue"/>'
+        "</form>"
+        f'<form id="skipForm" method="post" action="{action}">'
+        f'<input type="hidden" name="__VIEWSTATE" value="{viewstate}"/>'
+        '<input type="hidden" name="chkAddress$auto" value="5000 W FROZEN AVE"/>'
+        '<input type="hidden" name="btnNext2" value="Continue"/>'
+        "</form></body></html>")
+
+
 _counter = itertools.count(1)
 
 
@@ -395,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
                     ok = ain == ("5443", "016", "018")
             else:
                 street = one("Address$txtAddressStreetName").upper()
+                if street == "FROZEN" and one("Address$txtAddressBegNo") == "5000":
+                    return self._send(_frozen_choice_page(vs), sid, is_new)
                 if street == "VARIANT" and one("Address$txtAddressBegNo") == "4000":
                     direction = one("Address$txtAddressDirection").upper().strip()
                     if direction in ("", "W"):

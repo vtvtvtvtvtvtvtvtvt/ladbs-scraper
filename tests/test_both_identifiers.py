@@ -60,8 +60,9 @@ class TestBothTogether:
     def test_both_searches_actually_ran(self, both):
         kinds = [s["type"] for s in both["diagnostics"]["searches"]]
         assert kinds[:2] == ["ain", "address"]
-        # Direction variants follow the two primary legs.
-        assert all(k == "address_variant" for k in kinds[2:])
+        # The held-screen pass and direction variants follow the two
+        # primary legs.
+        assert all(k in ("address_variant", "address_grid") for k in kinds[2:])
 
     def test_each_search_reports_its_contribution(self, both):
         searches = {s["type"]: s for s in both["diagnostics"]["searches"]}
