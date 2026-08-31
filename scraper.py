@@ -24,23 +24,6 @@ MAX_RESULT_PAGES = 25
 # as truncated, rather than letting the caller time out with nothing.
 SCRAPE_BUDGET_SECONDS = float(os.environ.get("SCRAPE_TIMEOUT_SECONDS", "150"))
 
-# ParcelSearch.aspx runs CheckResult() on load, which fast-forwards past the
-# "1st intermediate screen" — the page listing every matching address row —
-# by pre-answering it with the primary address. A person sees that screen; the
-# scraper never did. This trap makes the page's own assignment of CheckResult
-# a no-op, so the flow freezes on the address list and every row is walkable.
-FREEZE_ADDRESS_SCREEN_JS = """
-(() => {
-  const noop = function () {};
-  try {
-    Object.defineProperty(window, 'CheckResult', {
-      configurable: false,
-      get() { return noop; },
-      set(_) {},
-    });
-  } catch (e) {}
-})();
-"""
 
 # Detail pages are independent GETs, and a busy parcel has hundreds of them.
 # Fetched one at a time they dominate the whole scrape; a small pool cuts that
@@ -578,15 +561,25 @@ class LADBSScraper:
                     collected.extend(found)
 
                     if expand_directions and self._time_left() > 25:
-                        # A second pass with the auto-advance neutered, so the
-                        # address-choice screen stays put and every row on it
-                        # is walked — the rows the fast-forward skips.
-                        found = await self._frozen_grid_leg(
-                            number, street_name, direction)
+                        # The document-side flow — the one a person uses, and
+                        # the one that offers the full address list.
+                        found = await self._collect_records(
+                            lambda: self._start_doc_address_search(
+                                number, street_name, direction))
                         self._note_search(
-                            "address_grid",
-                            f"{number} {street_name} (choice screen held)",
-                            found)
+                            "address_documents",
+                            f"{number} {street_name} (document search)", found)
+                        collected.extend(found)
+
+                    if expand_directions and self._time_left() > 25:
+                        # Range mode: an End No makes single-record
+                        # auto-resolution impossible.
+                        found = await self._collect_records(
+                            lambda: self._start_range_search(
+                                number, street_name, direction))
+                        self._note_search(
+                            "address_range",
+                            f"{number}-{number} {street_name}", found)
                         collected.extend(found)
 
                     if expand_directions:
@@ -629,26 +622,6 @@ class LADBSScraper:
             return result
 
         return await self._run(worker)
-
-    async def _frozen_grid_leg(self, number, street_name, direction):
-        """Search again on a page where the auto-advance cannot run."""
-        frozen = await self._context.new_page()
-        await frozen.add_init_script(FREEZE_ADDRESS_SCREEN_JS)
-        previous = self._page
-        self._page = frozen
-        try:
-            return await self._collect_records(
-                lambda: self._start_address_search(
-                    number, street_name, direction))
-        except Exception as e:
-            self._warn(f"held-screen pass failed: {e}")
-            return []
-        finally:
-            self._page = previous
-            try:
-                await frozen.close()
-            except Exception:
-                pass
 
     def _note_search(self, kind, query, records):
         """Record what one search contributed, so a thin result is traceable."""
@@ -949,28 +922,68 @@ class LADBSScraper:
         self._step(f"after assessor search: {self._page.url}")
 
     async def _set_direction(self, direction):
-        """The direction control is a dropdown on the live form, not a text
-        input — filling it as text silently searched without a direction."""
-        for sel in ("select[name*='Direction' i]", "select[id*='Direction' i]",
-                    "select[name*='Dir' i]", "select[id*='Dir' i]"):
+        """The live control is the text input Address$txtAddressDir. A bare
+        "Dir" wildcard also matches a hidden state field of that name and
+        times out on it, so wildcards must exclude hidden elements."""
+        for sel in ("input[name='Address$txtAddressDir']",
+                    "input[name*='AddressDir' i]:visible",
+                    "select[name*='Dir' i]",
+                    "select[id*='Dir' i]"):
             try:
                 loc = self._page.locator(sel).first
                 if await loc.count() == 0:
                     continue
-                try:
-                    await loc.select_option(value=direction, timeout=4000)
-                except Exception:
-                    await loc.select_option(label=direction, timeout=4000)
-                self._step(f"selected direction {direction} via {sel}")
+                if sel.startswith("select"):
+                    try:
+                        await loc.select_option(value=direction, timeout=4000)
+                    except Exception:
+                        await loc.select_option(label=direction, timeout=4000)
+                else:
+                    await loc.fill(direction, timeout=4000)
+                self._step(f"set direction {direction} via {sel}")
                 return True
             except Exception as e:
-                self._warn(f"direction dropdown {sel} failed: {e}")
-        return await self._fill_first(
-            ["input[name='Address$txtAddressDirection']",
-             "input[id*='AddressDirection']", "input[name*='Dir' i]"],
-            direction, "direction")
+                self._warn(f"direction control {sel} failed: {e}")
+        self._warn(f"no usable direction control for {direction!r}")
+        return False
 
-    async def _start_address_search(self, number, street_name, direction):
+    async def _start_doc_address_search(self, number, street_name, direction):
+        """The "Search Records by: Address" flow on the document side.
+
+        The parcel-side search resolves to a single parcel server-side and
+        never offers the address list; this one is the flow behind the
+        screenshots that show it.
+        """
+        await self._goto(MAIN_URL)
+        await self._goto(f"{BASE_URL}/DocumentSearch.aspx?SearchType=DCMT_ADDR")
+        if self.debug and "doc_search_form_page" not in self._diag:
+            self._diag["doc_search_form_page"] = self._page_inventory(
+                await self._page.content())
+        await self._fill_first(
+            ["input[name='Address$txtAddressBegNo']",
+             "input[name*='BegNo' i]:visible"],
+            number, "doc-search house number")
+        await self._fill_first(
+            ["input[name='Address$txtAddressStreetName']",
+             "input[name*='StreetName' i]:visible"],
+            street_name, "doc-search street name")
+        if direction:
+            await self._set_direction(direction)
+        await self._click_first(
+            ["input[name='btnNext1']",
+             "input[type='submit'][value='Next']",
+             "input[type='submit']:visible"],
+            "doc-search submit")
+        self._step(f"after document-side search: {self._page.url}")
+
+    async def _start_range_search(self, number, street_name, direction):
+        """The address search with End No filled — range mode, which cannot be
+        auto-resolved to a single address record."""
+        await self._start_address_search(number, street_name, direction,
+                                         end_number=number)
+
+    async def _start_address_search(self, number, street_name, direction,
+                                    end_number=None):
         await self._goto(MAIN_URL)
         await self._goto(f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
         if self.debug and "search_form_page" not in self._diag:
@@ -983,6 +996,10 @@ class LADBSScraper:
         await self._fill_first(
             ["input[name='Address$txtAddressStreetName']", "input[id*='AddressStreetName']"],
             street_name, "street name")
+        if end_number:
+            await self._fill_first(
+                ["input[name='Address$txtAddressEndNo']", "input[id*='AddressEndNo']"],
+                end_number, "end number")
         if direction:
             await self._set_direction(direction)
 

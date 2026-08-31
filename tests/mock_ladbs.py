@@ -344,7 +344,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send("", sid, is_new)
         vs = self._issue_viewstate(sid)
 
-        if url.path.endswith("/ParcelSearch.aspx"):
+        if (url.path.endswith("/ParcelSearch.aspx")
+                or (url.path.endswith("/DocumentSearch.aspx")
+                    and (qs.get("SearchType") or [""])[0].startswith("DCMT"))):
             STATE.searches += 1
             search_type = (qs.get("SearchType") or [""])[0]
             if search_type == "PRCL_ASMT":

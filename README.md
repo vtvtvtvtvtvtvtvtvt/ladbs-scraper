@@ -277,16 +277,19 @@ passes an AIN where an address is expected still gets results.
 timeout **above** this value — otherwise the client aborts a request the
 service was about to answer, and you lose records that were already collected.
 
-**The held-screen pass:** ParcelSearch runs a `CheckResult()` script on load
-that fast-forwards past the address-choice screen ("1st intermediate screen"),
-pre-answering it with the parcel's primary address — which is why a person
-sees a list of matching addresses and the scraper historically never did.
-Alongside the normal search, a second pass runs in a page where that function
-is neutered, so the choice screen holds still and every address row on it is
-walked. It reports as `address_grid` in `diagnostics.searches`.
+**Two search systems.** The parcel-side address search
+(`ParcelSearch.aspx?SearchType=PRCL_ADDR`) resolves a query to a single
+parcel server-side and never offers the multi-address choice screen — the
+skip happens on the server, not in page script. The document-side search
+(`DocumentSearch.aspx?SearchType=DCMT_ADDR`) is the flow a person uses and
+the one that lists every matching address. A scrape runs both, plus a range
+pass (End No filled, which rules out single-record auto-resolution); they
+report as `address_documents` and `address_range` in `diagnostics.searches`,
+and selections already walked by an earlier leg are skipped.
 
-**Direction variants:** the direction control on the live form is a dropdown,
-and it is selected as one (with a text-input fallback). The same street number
+**Direction variants:** the live control is the text input
+`Address$txtAddressDir` — a bare "Dir" wildcard also matches a hidden state
+field, so wildcards exclude hidden elements. The same street number
 can exist with and without a directional prefix — `2100 CYPRESS`, `2100 N CYPRESS` and `2100 W CYPRESS` are
 separate address records that can belong to separate parcels, and a
 direction-less search resolves to only one of them. By default
