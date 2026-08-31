@@ -770,9 +770,12 @@ class LADBSScraper:
             "check_result_script": scripts or None,
             "search_type_links": search_links,
             "title": soup.title.get_text(strip=True) if soup.title else "",
-            "inputs": [f"{el.get('type', el.name)}:"
-                       f"{el.get('name') or el.get('id') or '?'}"
-                       for el in soup.find_all(["input", "select"])][:60],
+            "inputs": [
+                (f"select:{el.get('name') or el.get('id') or '?'}"
+                 f"{[o.get('value', o.get_text(strip=True)) for o in el.find_all('option')][:8]}"
+                 if el.name == "select" else
+                 f"{el.get('type', el.name)}:{el.get('name') or el.get('id') or '?'}")
+                for el in soup.find_all(["input", "select"])][:60],
             "tables": [t.get("id") or f"(unnamed, {len(t.find_all('tr'))} rows)"
                        for t in soup.find_all("table")][:40],
             "iframes": [f.get("src", "") for f in soup.find_all(["iframe", "frame"])],
@@ -945,9 +948,34 @@ class LADBSScraper:
             "assessor search")
         self._step(f"after assessor search: {self._page.url}")
 
+    async def _set_direction(self, direction):
+        """The direction control is a dropdown on the live form, not a text
+        input — filling it as text silently searched without a direction."""
+        for sel in ("select[name*='Direction' i]", "select[id*='Direction' i]",
+                    "select[name*='Dir' i]", "select[id*='Dir' i]"):
+            try:
+                loc = self._page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                try:
+                    await loc.select_option(value=direction, timeout=4000)
+                except Exception:
+                    await loc.select_option(label=direction, timeout=4000)
+                self._step(f"selected direction {direction} via {sel}")
+                return True
+            except Exception as e:
+                self._warn(f"direction dropdown {sel} failed: {e}")
+        return await self._fill_first(
+            ["input[name='Address$txtAddressDirection']",
+             "input[id*='AddressDirection']", "input[name*='Dir' i]"],
+            direction, "direction")
+
     async def _start_address_search(self, number, street_name, direction):
         await self._goto(MAIN_URL)
         await self._goto(f"{BASE_URL}/ParcelSearch.aspx?SearchType=PRCL_ADDR")
+        if self.debug and "search_form_page" not in self._diag:
+            self._diag["search_form_page"] = self._page_inventory(
+                await self._page.content())
 
         await self._fill_first(
             ["input[name='Address$txtAddressBegNo']", "input[id*='AddressBegNo']"],
@@ -956,9 +984,7 @@ class LADBSScraper:
             ["input[name='Address$txtAddressStreetName']", "input[id*='AddressStreetName']"],
             street_name, "street name")
         if direction:
-            await self._fill_first(
-                ["input[name='Address$txtAddressDirection']", "input[id*='AddressDirection']"],
-                direction, "direction")
+            await self._set_direction(direction)
 
         await self._click_first(
             ["input[name='btnNext1']",

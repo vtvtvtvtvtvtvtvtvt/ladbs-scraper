@@ -285,8 +285,9 @@ Alongside the normal search, a second pass runs in a page where that function
 is neutered, so the choice screen holds still and every address row on it is
 walked. It reports as `address_grid` in `diagnostics.searches`.
 
-**Direction variants:** the same street number can exist with and without a
-directional prefix — `2100 CYPRESS`, `2100 N CYPRESS` and `2100 W CYPRESS` are
+**Direction variants:** the direction control on the live form is a dropdown,
+and it is selected as one (with a text-input fallback). The same street number
+can exist with and without a directional prefix — `2100 CYPRESS`, `2100 N CYPRESS` and `2100 W CYPRESS` are
 separate address records that can belong to separate parcels, and a
 direction-less search resolves to only one of them. By default
 (`expand_directions: true`) the scraper re-runs the search with each prefix

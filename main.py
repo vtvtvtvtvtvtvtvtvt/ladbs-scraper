@@ -171,6 +171,7 @@ async def scrape_get(
                     {"row": st.get("row"), "records": st.get("records")}
                     for st in s.get("steps", []) if st.get("step") == "row"
                 ],
+                "steps": s.get("steps"),
                 "combined": next(
                     (st.get("records") for st in s.get("steps", [])
                      if st.get("step") == "combined"), None),
@@ -190,6 +191,7 @@ async def scrape_get(
         "summary": result.get("summary"),
         # Raw evidence for the parsing gaps, captured automatically.
         "evidence": {
+            "search_form_page": diag.get("search_form_page"),
             "frames": diag.get("frames"),
             "post_search_page": diag.get("post_search_page"),
             "selection_page": diag.get("selection_page"),
