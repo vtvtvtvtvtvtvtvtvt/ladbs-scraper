@@ -959,25 +959,19 @@ class LADBSScraper:
         if self.debug and "doc_search_form_page" not in self._diag:
             self._diag["doc_search_form_page"] = self._page_inventory(
                 await self._page.content())
-        number_ok = await self._fill_first(
-            ["input[name='Address$txtAddressBegNo']",
-             "input[name*='JobAddressBegNo' i]",
-             "input[name*='JobAddressNo' i]",
-             "input[name*='JobAddress' i][name*='Beg' i]",
-             "input[name*='BegNo' i]:visible"],
-            number, "doc-search house number")
-        street_ok = await self._fill_first(
-            ["input[name='Address$txtAddressStreetName']",
-             "input[name*='JobAddressStreetName' i]",
-             "input[name*='StreetName' i]:visible"],
-            street_name, "doc-search street name")
-        if not (number_ok and street_ok) and "doc_search_form_page" not in self._diag:
+        # This form is a single free-text box — Address$txtAddress — not the
+        # parcel side's separate number/street/direction fields.
+        query = " ".join(x for x in (number, direction, street_name) if x)
+        filled = await self._fill_first(
+            ["input[name='Address$txtAddress']",
+             "input[name*='txtAddress' i]:visible"],
+            query, "doc-search address")
+        if not filled and "doc_search_form_page" not in self._diag:
             self._diag["doc_search_form_page"] = self._page_inventory(
                 await self._page.content())
-        if direction:
-            await self._set_direction(direction)
         await self._click_first(
-            ["input[name='btnNext1']",
+            ["input[name='btnSearchAddress']",
+             "input[name='btnNext1']",
              "input[type='submit'][value='Next']",
              "input[type='submit']:visible"],
             "doc-search submit")

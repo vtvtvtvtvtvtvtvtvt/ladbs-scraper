@@ -190,6 +190,17 @@ def _frozen_choice_page(viewstate):
         "</form></body></html>")
 
 
+DOCSIDE_PARCELS = [
+    {"id": "chkAddress$d0", "dom_id": "chkAddress_d0", "label": "600 DOCSIDE AVE"},
+    {"id": "chkAddress$d1", "dom_id": "chkAddress_d1", "label": "600 W DOCSIDE AVE"},
+]
+RECORDS["600 DOCSIDE AVE"] = {1: [
+    (f"{850 + j}", "Building Permit", "New", "01/01/1970",
+     f"1970LA{85000 + j}", "") for j in range(2)]}
+RECORDS["600 W DOCSIDE AVE"] = {1: [
+    (f"{860 + j}", "Building Permit", "Alteration", "02/02/1971",
+     f"1971LA{86000 + j}", "") for j in range(3)]}
+
 _counter = itertools.count(1)
 
 
@@ -343,6 +354,16 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/favicon.ico":
             return self._send("", sid, is_new)
         vs = self._issue_viewstate(sid)
+
+        if (url.path.endswith("/DocumentSearch.aspx")
+                and (qs.get("SearchType") or [""])[0] == "DCMT_ADDR"):
+            STATE.searches += 1
+            body = ("Address: <input type='text' name='Address$txtAddress' "
+                    "id='Address_txtAddress'/>"
+                    "<input type='submit' name='btnSearchAddress' "
+                    "id='btnSearchAddress' value='Search'/>")
+            action = f"{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ADDR"
+            return self._send(_page(body, vs, action), sid, is_new)
 
         if (url.path.endswith("/ParcelSearch.aspx")
                 or (url.path.endswith("/DocumentSearch.aspx")
@@ -501,6 +522,27 @@ class Handler(BaseHTTPRequestHandler):
             boxes.append("<input type='submit' name='btnNext2' id='btnNext2' value='Continue'/>")
             action = f"{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ASSR"
             return self._send(_page("".join(boxes), vs, action), sid, is_new)
+
+        if "btnSearchAddress" in form:
+            query = one("Address$txtAddress").upper().split(",")[0].strip()
+            if query in ("600 DOCSIDE", "600 DOCSIDE AVE"):
+                rows = "".join(
+                    f"<tr><td><input type='checkbox' id='{p['dom_id']}' "
+                    f"name='{p['id']}' value='{p['label']}'/></td>"
+                    f"<td>{p['label'].split()[0]}</td><td></td>"
+                    f"<td>{'W' if ' W ' in ' ' + p['label'] + ' ' else ''}</td>"
+                    f"<td>DOCSIDE</td><td>AVE</td></tr>"
+                    for p in DOCSIDE_PARCELS)
+                body = ("<table><tr><th>Select</th><th>Beg Nbr</th>"
+                        "<th>End Nbr</th><th>Dir</th><th>Str Name</th>"
+                        "<th>Str Type</th></tr>" + rows + "</table>"
+                        "<input type='submit' name='btnNext2' id='btnNext2' "
+                        "value='Continue'/>")
+                action = f"{IDIS}/DocumentSearch.aspx?SearchType=DCMT_ADDR"
+                return self._send(_page(body, vs, action), sid, is_new)
+            return self._send(
+                "<html><body>No addresses matched your search.</body></html>",
+                sid, is_new)
 
         # Step 2 -> results, or a second selection page for two-level parcels
         if "btnNext2" in form:
