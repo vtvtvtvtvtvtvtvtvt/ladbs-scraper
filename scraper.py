@@ -959,14 +959,21 @@ class LADBSScraper:
         if self.debug and "doc_search_form_page" not in self._diag:
             self._diag["doc_search_form_page"] = self._page_inventory(
                 await self._page.content())
-        await self._fill_first(
+        number_ok = await self._fill_first(
             ["input[name='Address$txtAddressBegNo']",
+             "input[name*='JobAddressBegNo' i]",
+             "input[name*='JobAddressNo' i]",
+             "input[name*='JobAddress' i][name*='Beg' i]",
              "input[name*='BegNo' i]:visible"],
             number, "doc-search house number")
-        await self._fill_first(
+        street_ok = await self._fill_first(
             ["input[name='Address$txtAddressStreetName']",
+             "input[name*='JobAddressStreetName' i]",
              "input[name*='StreetName' i]:visible"],
             street_name, "doc-search street name")
+        if not (number_ok and street_ok) and "doc_search_form_page" not in self._diag:
+            self._diag["doc_search_form_page"] = self._page_inventory(
+                await self._page.content())
         if direction:
             await self._set_direction(direction)
         await self._click_first(
@@ -1042,7 +1049,8 @@ class LADBSScraper:
         self._diag["checkboxes_found"] = len(checkboxes)
         # Recorded here so it is reported whatever parcel_mode is in use.
         self._diag["parcels"] = [c.get("label") or c["name"] for c in checkboxes]
-        self._diag["address_rows_found"] = len(checkboxes)
+        self._diag["address_rows_found"] = max(
+            self._diag.get("address_rows_found", 0), len(checkboxes))
         if checkboxes or "selection_page" not in self._diag:
             self._diag["selection_page"] = {
                 "checkboxes": [{"name": c["name"], "id": c.get("id", ""),
@@ -1148,7 +1156,8 @@ class LADBSScraper:
                     {"step": "row", "row": label, "records": 0})
                 self._warn(f"{label}: no results grid and no onward selection")
         if depth == 0:
-            self._diag["address_rows_checked"] = ticked
+            self._diag["address_rows_checked"] = max(
+                self._diag.get("address_rows_checked", 0), ticked)
         return out
 
     async def _submit_rows(self, rows):

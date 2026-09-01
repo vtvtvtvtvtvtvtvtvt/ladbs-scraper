@@ -192,6 +192,7 @@ async def scrape_get(
         # Raw evidence for the parsing gaps, captured automatically.
         "evidence": {
             "search_form_page": diag.get("search_form_page"),
+            "doc_search_form_page": diag.get("doc_search_form_page"),
             "frames": diag.get("frames"),
             "post_search_page": diag.get("post_search_page"),
             "selection_page": diag.get("selection_page"),
